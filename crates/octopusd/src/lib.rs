@@ -926,7 +926,10 @@ impl<B: Backend> Dispatcher<B> {
                 for (h, c) in heads.iter().zip(ctx) {
                     *got.entry(h.group.clone()).or_default() += 1;
                     if let Some(st) = core.groups.get_mut(&h.group) {
-                        let known = st.inflight.contains_key(&h.key.source) || st.ready.iter().any(|r| r.head.key.source == h.key.source);
+                        // a read that started before a "done" can return after it: skip what is already removed
+                        let known = st.inflight.contains_key(&h.key.source)
+                            || st.cursor.get(&h.key.source).is_some_and(|c| *c >= h.key.seq)
+                            || st.ready.iter().any(|r| r.head.key.source == h.key.source);
                         if st.serving && !known {
                             st.ready.push_back(ReadyHead { head: h.clone(), context: c.clone() });
                         }

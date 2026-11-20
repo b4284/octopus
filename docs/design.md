@@ -31,6 +31,29 @@ exactly once. The SQL database is the only durable state.
 - **Zero downtime during a database failover.** That failover is zero loss, but publishes and commits pause
   until the new primary is up: seconds with automatic failover.
 
+## 1b. Responsibilities (owner, 2026-11-20)
+
+Octopus is a product with a database backend; only Octopus touches its own tables.
+
+| | Octopus (dispatchers) | worker |
+|---|---|---|
+| durability | stores every published event (in Postgres, with the synchronous standby) before acknowledging the producer | — |
+| assignment | hands each source's next event to a free worker slot; at most one event per source in flight | — |
+| business data | never sees it | reads and writes its own tables in its own `BEGIN … COMMIT` (through PgBouncer) |
+| completion | on the worker's "done", removes the event so it is never handed out again | reports "done" after its commit |
+
+**What this means for exactly-once.**
+- A worker can commit and then crash before its "done" arrives. Octopus cannot know about that commit, so it
+  hands the event out again.
+- Exactly-once on the worker's data therefore rests on the worker's idempotency key `(source, seq)`: a per-source
+  "last applied seq", or a unique key, in its own tables.
+- Octopus flags every delivery it may have handed out before (`possibly_redelivered`): after a delivery timeout,
+  after a "done" that hit a database error, and for events older than the group's current owner. Workers check
+  their key at least for those.
+- Order is Octopus's: `seq + 1` is handed out only after `seq` is reported done.
+
+The apply/load hooks (state change committed by the dispatcher) remain an optional mode.
+
 ## 2. Guarantees (invariants checked by an end-state oracle in every test)
 
 | # | Invariant | Enforced by |
