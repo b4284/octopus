@@ -268,11 +268,18 @@ async fn a_failing_apply_hook_does_not_hold_back_other_sources() {
 struct OwnCommit {
     calls: AtomicU64,
     unflagged_repeats: Arc<AtomicU64>,
+    pool: deadpool_postgres::Pool,
+}
+
+fn pool(size: usize) -> deadpool_postgres::Pool {
+    let cfg: tokio_postgres::Config = pg().parse().unwrap();
+    let mgr = deadpool_postgres::Manager::new(cfg, tokio_postgres::NoTls);
+    deadpool_postgres::Pool::builder(mgr).max_size(size).build().unwrap()
 }
 
 impl Handler for OwnCommit {
     async fn handle(&self, d: Delivery) -> Outcome {
-        let mut c = db().await;
+        let mut c = self.pool.get().await.unwrap();
         let tx = c.transaction().await.unwrap();
         let n = tx
             .execute("INSERT INTO octo_test.applied VALUES ($1, $2, 'own') ON CONFLICT (source, seq) DO NOTHING", &[&d.source, &d.seq])
@@ -300,7 +307,7 @@ async fn workers_commit_their_own_writes_and_report_done() {
     let mut workers = vec![];
     for i in 0..2 {
         let id = format!("{ns}-w{i}");
-        let h = OwnCommit { calls: AtomicU64::new(i), unflagged_repeats: unflagged.clone() };
+        let h = OwnCommit { calls: AtomicU64::new(i), unflagged_repeats: unflagged.clone(), pool: pool(8) };
         // every worker serves every group, so its slots are split between two owning dispatchers
         let (w, rx) = Worker::connect(MqttConfig::new("127.0.0.1", 1883, id.clone()), WorkerConfig::new(id, ns.clone(), groups.clone(), 8), h)
             .await

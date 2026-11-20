@@ -170,6 +170,22 @@ async fn remove_returns_the_next_event() {
 }
 
 #[tokio::test]
+async fn advance_is_monotonic_and_read_events_finds_by_key() {
+    let b = backend().await;
+    let (g, s) = (uniq("g"), uniq("s"));
+    b.publish(&[ev(&g, &s, 1, "a"), ev(&g, &s, 2, "b"), ev(&g, &s, 3, "c")]).await.unwrap();
+    let found = b.read_events(&[EventKey::new(&s, 2), EventKey::new(&s, 9)]).await.unwrap();
+    assert_eq!(found.len(), 1);
+    assert_eq!((found[0].group.as_str(), found[0].body.as_ref()), (g.as_str(), &b"b"[..]));
+    // done up to 2, delivered out of order and repeated: the cursor ends at 2, events 1 and 2 are gone
+    b.advance(&[(s.clone(), 2), (s.clone(), 1)]).await.unwrap();
+    b.advance(&[(s.clone(), 1)]).await.unwrap();
+    assert!(b.read_events(&[EventKey::new(&s, 1), EventKey::new(&s, 2)]).await.unwrap().is_empty());
+    let heads = b.read_heads(&[req(&g, 10)]).await.unwrap();
+    assert_eq!(heads.iter().map(|h| h.key.clone()).collect::<Vec<_>>(), vec![EventKey::new(&s, 3)]);
+}
+
+#[tokio::test]
 async fn failure_counts_attempts_and_delays_the_head() {
     let b = backend().await;
     let (g, s) = (uniq("g"), uniq("s"));

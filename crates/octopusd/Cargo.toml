@@ -28,3 +28,4 @@ xxhash-rust = { version = "0.8.21", features = ["xxh3"] }
 [dev-dependencies]
 octopus-client = { path = "../octopus-client" }
 tokio-postgres.workspace = true
+deadpool-postgres.workspace = true

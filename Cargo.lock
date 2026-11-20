@@ -617,6 +617,7 @@ name = "octopusd"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "deadpool-postgres",
  "octopus-client",
  "octopus-core",
  "octopus-fabric",

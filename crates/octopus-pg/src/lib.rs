@@ -233,6 +233,47 @@ impl Backend for PgBackend {
         Ok(out)
     }
 
+    async fn advance(&self, cursors: &[(String, i64)]) -> Result<()> {
+        if cursors.is_empty() {
+            return Ok(());
+        }
+        let src: Vec<&str> = cursors.iter().map(|(s, _)| s.as_str()).collect();
+        let seq: Vec<i64> = cursors.iter().map(|(_, q)| *q).collect();
+        let c = self.client().await?;
+        let st = c.prepare_cached(&self.q("SELECT octopus.advance($1, $2)")).await.map_err(db)?;
+        c.query_one(&st, &[&src, &seq]).await.map_err(db)?;
+        Ok(())
+    }
+
+    async fn read_events(&self, keys: &[EventKey]) -> Result<Vec<Head>> {
+        if keys.is_empty() {
+            return Ok(vec![]);
+        }
+        let src: Vec<&str> = keys.iter().map(|k| k.source.as_str()).collect();
+        let seq: Vec<i64> = keys.iter().map(|k| k.seq).collect();
+        let c = self.client().await?;
+        let st = c
+            .prepare_cached(&self.q(
+                "SELECT e.grp, e.source, e.seq, e.body, e.attempts, (extract(epoch FROM e.enqueued_at) * 1000000)::bigint \
+                   FROM unnest($1::text[], $2::bigint[]) AS k(s, q) \
+                   JOIN octopus.event e ON e.source = k.s AND e.seq = k.q \
+                  WHERE e.not_before IS NULL OR e.not_before <= now()",
+            ))
+            .await
+            .map_err(db)?;
+        let rows = c.query(&st, &[&src, &seq]).await.map_err(db)?;
+        Ok(rows
+            .into_iter()
+            .map(|r| Head {
+                group: r.get(0),
+                key: EventKey { source: r.get(1), seq: r.get(2) },
+                body: Bytes::from(r.get::<_, Vec<u8>>(3)),
+                attempts: r.get(4),
+                enqueued_at_us: r.get(5),
+            })
+            .collect())
+    }
+
     async fn fail(&self, key: &EventKey, delay: Duration) -> Result<()> {
         let c = self.client().await?;
         let st = c

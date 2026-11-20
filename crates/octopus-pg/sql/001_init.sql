@@ -137,20 +137,62 @@ BEGIN
 END $$;
 
 -- Remove events reported done (workers committed their own writes), and return each source's next event if it
--- is stored, so the dispatcher can hand it out without searching. rc: 0 removed now, 1 already removed, 2 gap.
+-- is stored, so the dispatcher can hand it out without searching. rc: 0 removed now, 1 already removed.
+--
+-- "Up to": the cursor moves to the highest seq reported done, without a gap check. That is sound because a
+-- dispatcher hands out seq + 1 only after seq was reported done, so "seq + 1 done" implies "seq done"; and it lets
+-- two removal batches of one source commit in either order (the next event is handed out before the removal
+-- of the previous one commits).
 CREATE OR REPLACE FUNCTION octopus.remove_next(p_source text[], p_seq bigint[])
 RETURNS TABLE(i int, rc smallint, next_seq bigint, next_body bytea, next_attempts int, next_enqueued_us bigint)
 LANGUAGE plpgsql AS $$
 DECLARE
     codes smallint[];
 BEGIN
-    codes := octopus.commit_many(p_source, p_seq, array_fill(''::bytea, ARRAY[coalesce(array_length(p_source, 1), 0)]), NULL);
+    -- the highest reported seq per source; lock the cursors in source order
+    WITH want AS (
+        SELECT s, max(q) AS q FROM unnest(p_source, p_seq) AS u(s, q) GROUP BY s
+    ), locked AS (
+        SELECT src.source, src.last_seq FROM octopus.source src JOIN want ON want.s = src.source
+         ORDER BY src.source FOR UPDATE OF src
+    ), moved AS (
+        UPDATE octopus.source src SET last_seq = want.q
+          FROM want JOIN locked ON locked.source = want.s
+         WHERE src.source = want.s AND want.q > locked.last_seq
+        RETURNING src.source
+    )
+    SELECT array_agg(CASE WHEN l.last_seq < u.q THEN 0::smallint ELSE 1::smallint END ORDER BY u.o)
+      INTO codes
+      FROM unnest(p_source, p_seq) WITH ORDINALITY AS u(s, q, o)
+      LEFT JOIN locked l ON l.source = u.s;
+    DELETE FROM octopus.event e
+     USING (SELECT s, max(q) AS q FROM unnest(p_source, p_seq) AS u(s, q) GROUP BY s) w
+     WHERE e.source = w.s AND e.seq <= w.q;
     RETURN QUERY
     SELECT u.o::int, codes[u.o], e.seq, e.body, e.attempts, (extract(epoch FROM e.enqueued_at) * 1000000)::bigint
       FROM unnest(p_source) WITH ORDINALITY AS u(src, o)
       JOIN octopus.source s ON s.source = u.src
       LEFT JOIN octopus.event e ON e.source = u.src AND e.seq = s.last_seq + 1
                                AND (e.not_before IS NULL OR e.not_before <= now());
+END $$;
+
+-- Persist cursors advanced by "done" reports (written in bulk by the dispatcher, e.g. every 100 ms): each cursor
+-- only moves forward, and every event at or below it is deleted. Monotonic, so concurrent or repeated calls (two
+-- dispatchers around a hand-over, a retry) are harmless.
+CREATE OR REPLACE FUNCTION octopus.advance(p_source text[], p_seq bigint[])
+RETURNS bigint LANGUAGE plpgsql AS $$
+DECLARE
+    n bigint;
+BEGIN
+    PERFORM 1 FROM octopus.source WHERE source = ANY(p_source) ORDER BY source FOR UPDATE;
+    UPDATE octopus.source src SET last_seq = w.q
+      FROM (SELECT s, max(q) AS q FROM unnest(p_source, p_seq) AS u(s, q) GROUP BY s) w
+     WHERE src.source = w.s AND w.q > src.last_seq;
+    DELETE FROM octopus.event e
+     USING (SELECT s, max(q) AS q FROM unnest(p_source, p_seq) AS u(s, q) GROUP BY s) w
+     WHERE e.source = w.s AND e.seq <= w.q;
+    GET DIAGNOSTICS n = ROW_COUNT;
+    RETURN n;
 END $$;
 
 -- Rows left at or below their cursor by a publish/commit race on a source that has not committed since.

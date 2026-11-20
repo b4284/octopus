@@ -151,8 +151,11 @@ public sealed class OctopusConnection : IAsyncDisposable
 
     // ---- outgoing: coalesced per topic ----
 
-    /// <summary>Queue an envelope for <paramref name="topic"/>; it goes out with whatever else is queued for it.</summary>
-    public void Send(string topic, Envelope envelope) => GetOutbox(topic, isPublish: false).Enqueue(envelope);
+    /// <summary>
+    /// Queue an envelope for <paramref name="topic"/>; it goes out with whatever else is queued for it.
+    /// <paramref name="urgent"/>: latency-critical (results): flush without waiting out the linger.
+    /// </summary>
+    public void Send(string topic, Envelope envelope, bool urgent = false) => GetOutbox(topic, isPublish: false).Enqueue(envelope, urgent);
 
     /// <summary>Queue a publish request; requests for the same topic travel as one PublishBatch.</summary>
     internal void SendPublish(string topic, PublishRequest request) => GetOutbox(topic, isPublish: true).Enqueue(request);
@@ -171,11 +174,13 @@ public sealed class OctopusConnection : IAsyncDisposable
     {
         private readonly ConcurrentQueue<IMessage> _queue = new();
         private int _sending;
+        private int _urgent;
         private long _lastFlush;
 
-        public void Enqueue(IMessage m)
+        public void Enqueue(IMessage m, bool urgent = false)
         {
             _queue.Enqueue(m);
+            if (urgent) Volatile.Write(ref _urgent, 1);
             if (Interlocked.CompareExchange(ref _sending, 1, 0) == 0) _ = Task.Run(DrainAsync);
         }
 
@@ -186,7 +191,8 @@ public sealed class OctopusConnection : IAsyncDisposable
                 while (!_queue.IsEmpty)
                 {
                     long wait = _lastFlush + (long)conn._o.Linger.TotalMilliseconds - Environment.TickCount64;
-                    if (wait > 0) await Task.Delay((int)wait);
+                    if (wait > 0 && Interlocked.Exchange(ref _urgent, 0) == 0) await Task.Delay((int)wait);
+                    Volatile.Write(ref _urgent, 0);
                     _lastFlush = Environment.TickCount64;
                     var items = new List<IMessage>();
                     int bytes = 0;

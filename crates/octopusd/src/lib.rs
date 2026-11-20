@@ -59,9 +59,9 @@ impl Config {
             delivery_timeout: Duration::from_secs(30),
             fallback_poll: Duration::from_secs(1),
             worker_ttl: Duration::from_secs(10),
-            publish_executors: 4,
+            publish_executors: 16,
             publish_max_events: 2000,
-            commit_executors: 8,
+            commit_executors: 16,
             commit_max: 128,
             fetch_parallelism: 4,
             fetch_max_groups: 64,
@@ -106,12 +106,28 @@ struct GroupState {
     cursor: HashMap<String, i64>,
     /// source -> highest seq known stored
     known_max: HashMap<String, i64>,
+    /// source -> bodies of its stored events that are not heads yet (from publishes and hints), so the next one can
+    /// be handed out the moment its predecessor is reported done
+    pending: HashMap<String, std::collections::BTreeMap<i64, (Bytes, i64)>>,
+    pending_count: usize,
+    /// source -> the event to look up by key (its next one, not in memory); retried until found
+    want: HashMap<String, i64>,
+    want_fetching: bool,
+    last_want_fetch: Option<Instant>,
 }
+
+/// Bodies kept for not-yet-head events, per group (beyond that, the database is read).
+const PENDING_MAX_PER_GROUP: usize = 4096;
 
 /// Largest head body carried in a hint (bigger ones are read from the database by the owner).
 const HINT_BODY_MAX: usize = 64 * 1024;
 
 impl GroupState {
+    /// A wanted key has never been looked up yet (look it up now rather than after the retry interval).
+    fn dirty_want(&self) -> bool {
+        self.last_want_fetch.is_none()
+    }
+
     /// Queue a known head for hand-out unless it is stale or its source already has an event out or queued.
     fn offer(&mut self, head: Head) -> bool {
         let s = &head.key.source;
@@ -124,6 +140,46 @@ impl GroupState {
         }
         self.ready.push_back(ReadyHead { head, context: None });
         true
+    }
+
+    /// A worker reported `seq` of `source` done: it has committed its writes, so the source is free and its next
+    /// event can go out now (the removal from the database follows). Returns whether a next event was queued.
+    fn done(&mut self, group: &str, source: &str, seq: i64) -> bool {
+        if self.inflight.get(source).is_some_and(|f| f.seq == seq) {
+            self.inflight.remove(source);
+        }
+        self.suspect.remove(&(source.to_owned(), seq));
+        let c = self.cursor.entry(source.to_owned()).or_insert(0);
+        *c = (*c).max(seq);
+        let Some(p) = self.pending.get_mut(source) else {
+            self.want.insert(source.to_owned(), seq + 1);
+            return false;
+        };
+        // forget what is done, then take the next one if we hold it
+        while let Some((&q, _)) = p.first_key_value() {
+            if q > seq {
+                break;
+            }
+            p.pop_first();
+            self.pending_count -= 1;
+        }
+        let next = match p.first_key_value() {
+            Some((&q, _)) if q == seq + 1 => p.pop_first().map(|(q, (body, enq))| {
+                self.pending_count -= 1;
+                Head { group: group.to_owned(), key: EventKey { source: source.to_owned(), seq: q }, body, attempts: 0, enqueued_at_us: enq }
+            }),
+            _ => None,
+        };
+        if p.is_empty() {
+            self.pending.remove(source);
+        }
+        match next {
+            Some(h) => self.offer(h),
+            None => {
+                self.want.insert(source.to_owned(), seq + 1);
+                false
+            }
+        }
     }
 
     /// Events stored for this group (by this dispatcher or, via a hint, another one).
@@ -147,11 +203,29 @@ impl GroupState {
                         };
                         self.offer(head);
                     }
-                    None => self.dirty = true,
+                    None => {
+                        self.want.insert(e.source, e.seq);
+                    }
                 }
             } else if self.cursor.get(&e.source) == Some(&(e.seq - 1)) && !self.inflight.contains_key(&e.source) {
                 // stored while its predecessor was being removed: it is the head now
-                self.dirty = true;
+                match e.body {
+                    Some(body) => {
+                        let head = Head { group: group.to_owned(), key: EventKey { source: e.source, seq: e.seq }, body, attempts: 0, enqueued_at_us: e.enqueued_us };
+                        self.offer(head);
+                    }
+                    None => {
+                        self.want.insert(e.source, e.seq);
+                    }
+                }
+            } else if let Some(body) = e.body {
+                // not the head yet: keep its body for the moment its predecessor is reported done
+                if self.pending_count < PENDING_MAX_PER_GROUP && self.cursor.get(&e.source).is_none_or(|c| *c < e.seq) {
+                    let p = self.pending.entry(e.source).or_default();
+                    if p.insert(e.seq, (body, e.enqueued_us)).is_none() {
+                        self.pending_count += 1;
+                    }
+                }
             }
         }
     }
@@ -174,6 +248,8 @@ struct Core {
     owners: HashMap<String, (String, String)>,
     /// Hand out nothing after this instant unless the leases were renewed (local lease deadline).
     lease_deadline: Option<Instant>,
+    /// Cursors moved by "done" reports and not yet written to the database (flushed every ~100 ms).
+    unflushed: HashMap<String, i64>,
 }
 
 impl Core {
@@ -262,6 +338,34 @@ impl Core {
         (out.into_iter().collect(), demands)
     }
 
+    /// Next events to look up by key (their sources are free), every 100 ms per group at most.
+    fn due_key_fetches(&mut self, now: Instant) -> Vec<(String, EventKey)> {
+        let mut keys = vec![];
+        if !self.handing_out(now) {
+            return keys;
+        }
+        for (g, st) in self.groups.iter_mut() {
+            if !st.serving || st.want.is_empty() || st.want_fetching {
+                continue;
+            }
+            if st.last_want_fetch.is_some_and(|t| now.duration_since(t) < Duration::from_millis(100)) && !st.dirty_want() {
+                continue;
+            }
+            let GroupState { want, inflight, cursor, ready, .. } = st;
+            want.retain(|s, q| !inflight.contains_key(s) && cursor.get(s).is_none_or(|c| *c < *q));
+            for (s, q) in want.iter() {
+                if !ready.iter().any(|r| r.head.key.source == *s) {
+                    keys.push((g.clone(), EventKey { source: s.clone(), seq: *q }));
+                }
+            }
+            if !st.want.is_empty() {
+                st.want_fetching = true;
+                st.last_want_fetch = Some(now);
+            }
+        }
+        keys
+    }
+
     /// Groups that need a head read: serving, credited beyond what is ready, and dirty or due for a fallback read.
     fn due_fetches(&mut self, now: Instant, fallback: Duration) -> Vec<HeadRequest> {
         if !self.handing_out(now) {
@@ -333,6 +437,8 @@ pub struct Dispatcher<B: Backend> {
     inbox: String,
     core: Mutex<Core>,
     wake: Notify,
+    /// re-queues removals that hit a database error
+    retry_tx: Mutex<Option<mpsc::Sender<PendingResults>>>,
     pub stats: Stats,
     started_us: i64,
 }
@@ -362,6 +468,7 @@ impl<B: Backend> Dispatcher<B> {
             inbox,
             core: Mutex::new(Core::default()),
             wake: Notify::new(),
+            retry_tx: Mutex::new(None),
             stats: Stats::default(),
             started_us: now_us(),
         })
@@ -390,6 +497,7 @@ impl<B: Backend> Dispatcher<B> {
 
         let (pub_tx, pub_rx) = mpsc::channel::<PendingPublish>(65_536);
         let (res_tx, res_rx) = mpsc::channel::<PendingResults>(65_536);
+        *self.retry_tx.lock().unwrap() = Some(res_tx.clone());
         let (stop_tx, stop_rx) = watch::channel(false);
         let mut tasks = vec![
             tokio::spawn(self.clone().publish_loop(pub_rx)),
@@ -398,6 +506,7 @@ impl<B: Backend> Dispatcher<B> {
             tokio::spawn(self.clone().sweep_loop(stop_rx.clone())),
             tokio::spawn(self.clone().lease_loop(stop_rx.clone())),
             tokio::spawn(self.clone().housekeeping_loop(stop_rx.clone())),
+            tokio::spawn(self.clone().flush_loop(stop_rx.clone())),
         ];
         info!(member = %self.cfg.member_id, ns = %self.cfg.ns, "dispatcher running");
         loop {
@@ -424,7 +533,9 @@ impl<B: Backend> Dispatcher<B> {
                 _ = tokio::time::sleep(Duration::from_millis(50)) => {}
             }
         }
+        self.flush_cursors().await;
         let _ = stop_tx.send(true);
+        *self.retry_tx.lock().unwrap() = None;
         drop(pub_tx);
         drop(res_tx);
         if let Err(e) = self.backend.leave(&self.cfg.member_id).await {
@@ -490,9 +601,24 @@ impl<B: Backend> Dispatcher<B> {
                                 w.credit = w.credit.saturating_add(1);
                                 w.last_seen = now;
                             }
+                            // done = the worker committed: free the source and hand out its next event now; the
+                            // cursor is written to the database with the next flush (~100 ms)
+                            if it.ok && it.done && self.cfg.fast_path {
+                                if let Some(st) = core.groups.get_mut(&it.group) {
+                                    st.done(&it.group, &it.source, it.seq);
+                                }
+                                let c = core.unflushed.entry(it.source.clone()).or_insert(0);
+                                *c = (*c).max(it.seq);
+                                self.stats.applied.fetch_add(1, Relaxed);
+                            }
                         }
                     }
-                    let _ = res_tx.try_send(PendingResults { reply_to: r.reply_to, items: r.items });
+                    if self.cfg.fast_path {
+                        r.items.retain(|it| !(it.ok && it.done));
+                    }
+                    if !r.items.is_empty() {
+                        let _ = res_tx.try_send(PendingResults { reply_to: r.reply_to, items: r.items });
+                    }
                     self.wake.notify_one();
                 }
                 Some(Body::Hint(h)) => {
@@ -629,7 +755,7 @@ impl<B: Backend> Dispatcher<B> {
                             .map(|(o, it)| match o {
                                 PublishOutcome::Stored | PublishOutcome::StoredHead => {
                                     let head = *o == PublishOutcome::StoredHead;
-                                    let body = (head && it.body.len() <= HINT_BODY_MAX).then(|| it.body.clone());
+                                    let body = (it.body.len() <= HINT_BODY_MAX).then(|| it.body.clone());
                                     stored.entry(it.group.clone()).or_default().push(v1::HintEvent {
                                         group: it.group.clone(),
                                         source: it.source.clone(),
@@ -727,7 +853,16 @@ impl<B: Backend> Dispatcher<B> {
                 Ok(o) => o.into_iter().map(Some).collect(),
                 Err(e) => {
                     self.stats.commit_errors.fetch_add(1, Relaxed);
-                    warn!(error = %e, n = removals.len(), "remove batch failed");
+                    warn!(error = %e, n = removals.len(), "remove batch failed; retrying");
+                    // the workers have committed: the removal must happen; retry it shortly
+                    let retry: Vec<v1::WorkResult> =
+                        batch.iter().flat_map(|b| b.items.iter().filter(|r| r.ok && r.done).cloned()).collect();
+                    if let Some(tx) = self.retry_tx.lock().unwrap().clone() {
+                        tokio::spawn(async move {
+                            tokio::time::sleep(Duration::from_millis(200)).await;
+                            let _ = tx.send(PendingResults { reply_to: String::new(), items: retry }).await;
+                        });
+                    }
                     vec![None; removals.len()]
                 }
             }
@@ -764,7 +899,7 @@ impl<B: Backend> Dispatcher<B> {
         self.stats.commit_batches.fetch_add(1, Relaxed);
         let mut k = 0;
         // (group, source, seq, outcome known, for "done" removals: the source's next event) released from in-flight
-        let mut done: Vec<(String, String, i64, bool, Option<Option<Head>>)> = vec![];
+        let mut done: Vec<(String, String, i64, bool, Option<Option<Head>>, bool)> = vec![];
         let mut result_acks: HashMap<String, Vec<v1::ResultAck>> = HashMap::new();
         for b in batch {
             let mut acks = vec![];
@@ -829,7 +964,7 @@ impl<B: Backend> Dispatcher<B> {
                 // Release it either way: on an error nothing changed in Octopus's tables, so offer it again now (flagged:
                 // a "done" worker has committed its own writes already).
                 let known = status != v1::ResultStatus::ResultError && status != v1::ResultStatus::ResultGap;
-                done.push((r.group.clone(), r.source.clone(), r.seq, known || !r.done, next));
+                done.push((r.group.clone(), r.source.clone(), r.seq, known || !r.done, next, r.ok));
                 acks.push(v1::ResultAck { request_id: r.request_id, status: status as i32 });
             }
             if !b.reply_to.is_empty() {
@@ -843,7 +978,7 @@ impl<B: Backend> Dispatcher<B> {
         self.send_batched(replies).await;
         {
             let mut core = self.core.lock().unwrap();
-            for (g, s, q, outcome_known, next) in done {
+            for (g, s, q, outcome_known, next, ok) in done {
                 if let Some(st) = core.groups.get_mut(&g) {
                     if st.inflight.get(&s).is_some_and(|f| f.seq == q) {
                         st.inflight.remove(&s);
@@ -870,6 +1005,11 @@ impl<B: Backend> Dispatcher<B> {
                                 }
                             }
                         }
+                        // a failure: offer it again by key once its retry delay has passed
+                        _ if self.cfg.fast_path && !ok => {
+                            st.want.insert(s.clone(), q);
+                        }
+                        // committed through the apply hook: the database cursor is current, read the next head
                         _ => st.dirty = true,
                     }
                 }
@@ -890,12 +1030,20 @@ impl<B: Backend> Dispatcher<B> {
                 _ = stop.changed() => return,
             }
             let now = Instant::now();
-            let (sends, reqs) = {
+            let (sends, reqs, keys) = {
                 let mut core = self.core.lock().unwrap();
                 let sends = core.assign(now, self.cfg.delivery_timeout);
-                (sends, core.due_fetches(now, self.cfg.fallback_poll))
+                (sends, core.due_fetches(now, self.cfg.fallback_poll), core.due_key_fetches(now))
             };
             self.send_assignments(sends).await;
+            if !keys.is_empty() {
+                let permit = fetch_slots.clone().acquire_owned().await.unwrap();
+                let me = self.clone();
+                tokio::spawn(async move {
+                    me.fetch_keys(keys).await;
+                    drop(permit);
+                });
+            }
             for chunk in reqs.chunks(self.cfg.fetch_max_groups) {
                 let chunk = chunk.to_vec();
                 let permit = fetch_slots.clone().acquire_owned().await.unwrap();
@@ -926,9 +1074,17 @@ impl<B: Backend> Dispatcher<B> {
                 for (h, c) in heads.iter().zip(ctx) {
                     *got.entry(h.group.clone()).or_default() += 1;
                     if let Some(st) = core.groups.get_mut(&h.group) {
-                        // a read that started before a "done" can return after it: skip what is already removed
+                        // a read that started before a "done" (or before its cursor was flushed) can return events
+                        // already done: skip them and look up the real next one by key
+                        if let Some(&c) = st.cursor.get(&h.key.source) {
+                            if c >= h.key.seq {
+                                if !st.inflight.contains_key(&h.key.source) {
+                                    st.want.insert(h.key.source.clone(), c + 1);
+                                }
+                                continue;
+                            }
+                        }
                         let known = st.inflight.contains_key(&h.key.source)
-                            || st.cursor.get(&h.key.source).is_some_and(|c| *c >= h.key.seq)
                             || st.ready.iter().any(|r| r.head.key.source == h.key.source);
                         if st.serving && !known {
                             st.ready.push_back(ReadyHead { head: h.clone(), context: c.clone() });
@@ -966,6 +1122,66 @@ impl<B: Backend> Dispatcher<B> {
             if let Err(e) = self.fabric.publish(topic, payload).await {
                 warn!(error = %e, "reply send failed (the sender retries)");
             }
+        }
+    }
+
+    /// Look up wanted next events by key and queue the ones found (missing ones stay wanted).
+    async fn fetch_keys(&self, keys: Vec<(String, EventKey)>) {
+        let groups: HashSet<String> = keys.iter().map(|(g, _)| g.clone()).collect();
+        let list: Vec<EventKey> = keys.into_iter().map(|(_, k)| k).collect();
+        let result = self.backend.read_events(&list).await;
+        let now = Instant::now();
+        let sends = {
+            let mut core = self.core.lock().unwrap();
+            if let Ok(heads) = &result {
+                for h in heads {
+                    if let Some(st) = core.groups.get_mut(&h.group) {
+                        if st.want.get(&h.key.source) == Some(&h.key.seq) {
+                            st.want.remove(&h.key.source);
+                        }
+                        st.offer(h.clone());
+                    }
+                }
+            }
+            for g in groups {
+                if let Some(st) = core.groups.get_mut(&g) {
+                    st.want_fetching = false;
+                }
+            }
+            core.assign(now, self.cfg.delivery_timeout)
+        };
+        if let Err(e) = result {
+            warn!(error = %e, "key read failed");
+        }
+        self.send_assignments(sends).await;
+    }
+
+    /// Write the cursors moved by "done" reports (one bulk statement). On failure they are kept for the next try.
+    async fn flush_cursors(&self) {
+        let batch: Vec<(String, i64)> = {
+            let mut core = self.core.lock().unwrap();
+            if core.unflushed.is_empty() {
+                return;
+            }
+            core.unflushed.drain().collect()
+        };
+        if let Err(e) = self.backend.advance(&batch).await {
+            warn!(error = %e, n = batch.len(), "cursor flush failed; will retry");
+            let mut core = self.core.lock().unwrap();
+            for (s, q) in batch {
+                let c = core.unflushed.entry(s).or_insert(0);
+                *c = (*c).max(q);
+            }
+        }
+    }
+
+    async fn flush_loop(self: Arc<Self>, mut stop: watch::Receiver<bool>) {
+        loop {
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_millis(100)) => {}
+                _ = stop.changed() => return,
+            }
+            self.flush_cursors().await;
         }
     }
 
@@ -1107,6 +1323,8 @@ impl<B: Backend> Dispatcher<B> {
             }
         }
         if !release.is_empty() {
+            // the next owner reads cursors from the database: write ours first
+            self.flush_cursors().await;
             self.backend.release(&me.id, &release).await?;
             let mut core = self.core.lock().unwrap();
             for g in &release {

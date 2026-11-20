@@ -131,6 +131,13 @@ pub trait Backend: Send + Sync + 'static {
     /// Also returns each source's next event if it is stored and due (so it can be handed out without a search).
     fn remove(&self, keys: &[EventKey]) -> impl Future<Output = Result<Vec<(CommitOutcome, Option<Head>)>>> + Send;
 
+    /// Persist cursors moved by "done" reports, in bulk: each cursor only moves forward; events at or below it are
+    /// deleted. Monotonic and idempotent.
+    fn advance(&self, cursors: &[(String, i64)]) -> impl Future<Output = Result<()>> + Send;
+
+    /// The stored events with these keys that are due (not waiting for a retry delay); missing ones are skipped.
+    fn read_events(&self, keys: &[EventKey]) -> impl Future<Output = Result<Vec<Head>>> + Send;
+
     /// Record a failed attempt; the event is not handed out again before `delay` has passed.
     fn fail(&self, key: &EventKey, delay: Duration) -> impl Future<Output = Result<()>> + Send;
 

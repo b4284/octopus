@@ -122,7 +122,7 @@ public sealed class OctopusWorker : IAsyncDisposable
                 if (OwnerMembers().Contains(d.Member)) _granted[d.Member] = _granted.GetValueOrDefault(d.Member) + 1;
         }
         Interlocked.Increment(ref ResultsSent);
-        _conn.Send(alive ? d.MemberInbox : _conn.Topics.Any, new Envelope { Results = batch });
+        _conn.Send(alive ? d.MemberInbox : _conn.Topics.Any, new Envelope { Results = batch }, urgent: true);
     }
 
     /// <summary>The application is done with the delivery: its slot is free again.</summary>
