@@ -3,6 +3,13 @@ using Octopus.V1;
 namespace Octopus.Client;
 
 /// <summary>
+/// What Octopus answered for one published item. <see cref="MissingBelow"/>: positions directly below it (same epoch)
+/// that are neither stored nor applied. If the producer still has them in flight, nothing to do; if it lost them, it
+/// replays them or publishes a skip marker (an item with <c>SkipTo</c> set).
+/// </summary>
+public readonly record struct PublishAck(PublishStatus Status, long MissingBelow);
+
+/// <summary>
 /// Publishes events. A call returns only after the events are committed to the database; until then it is retried.
 /// Retries are safe: publishing is idempotent per (source, seq). Concurrent calls on one connection travel together
 /// (one PublishBatch per send), so callers can publish each event the moment it exists.
@@ -24,8 +31,8 @@ public sealed class OctopusProducer(OctopusConnection conn)
     public long StuckNow => Interlocked.Read(ref _stuck);
     private long _stuck;
 
-    /// <summary>Publishes and returns one status per item, in order, once committed.</summary>
-    public async Task<IReadOnlyList<PublishStatus>> PublishAsync(IReadOnlyList<PublishItem> items, CancellationToken ct = default)
+    /// <summary>Publishes and returns one answer per item, in order, once committed.</summary>
+    public async Task<IReadOnlyList<PublishAck>> PublishAsync(IReadOnlyList<PublishItem> items, CancellationToken ct = default)
     {
         if (items.Count == 0) return [];
         var req = new PublishRequest { ReplyTo = conn.Inbox };
@@ -54,7 +61,8 @@ public sealed class OctopusProducer(OctopusConnection conn)
             {
                 conn.SendPublish(topic, req.Clone());
                 var reply = await tcs.Task.WaitAsync(ReplyTimeout, ct);
-                if (reply.Error.Length == 0) return reply.Status;
+                if (reply.Error.Length == 0)
+                    return reply.Status.Select((st, i) => new PublishAck(st, i < reply.MissingBelow.Count ? reply.MissingBelow[i] : 0)).ToList();
                 if (reply.Error.StartsWith("invalid", StringComparison.Ordinal)) throw new ArgumentException(reply.Error);
             }
             catch (TimeoutException) { }

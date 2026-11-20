@@ -8,8 +8,21 @@ use std::time::Duration;
 use bytes::Bytes;
 use deadpool_postgres::{Manager, ManagerConfig, Pool, RecyclingMethod};
 use octopus_core::{
-    Backend, Commit, CommitOutcome, Error, Event, EventKey, Gap, Head, HeadRequest, Lease, Member, PublishOutcome, Result,
+    Backend, Commit, CommitOutcome, Error, Event, EventKey, Gap, Head, HeadRequest, Lease, Member, Pos, PublishOutcome, Published,
+    Result, Skipped,
 };
+
+/// A head from a row (grp, source, epoch, seq, body, attempts, enqueued_us, skip_to), starting at column `at`.
+fn head_row(r: &tokio_postgres::Row, at: usize) -> Head {
+    Head {
+        group: r.get(at),
+        key: EventKey::new(r.get::<_, String>(at + 1), Pos::new(r.get(at + 2), r.get(at + 3))),
+        body: Bytes::from(r.get::<_, Vec<u8>>(at + 4)),
+        attempts: r.get(at + 5),
+        enqueued_at_us: r.get(at + 6),
+        skip_to: r.get(at + 7),
+    }
+}
 use tokio_postgres::NoTls;
 
 const SCHEMA_SQL: &str = include_str!("../sql/001_init.sql");
@@ -46,8 +59,35 @@ pub struct PgBackend {
     load_sql: Option<String>,
 }
 
-fn db(e: impl std::fmt::Display) -> Error {
-    Error::Database(e.to_string())
+fn db(e: impl Into<DbErr>) -> Error {
+    Error::Database(e.into().0)
+}
+
+/// A database error as text, with the server's message and code when there is one ("db error" alone says nothing).
+struct DbErr(String);
+
+impl From<tokio_postgres::Error> for DbErr {
+    fn from(e: tokio_postgres::Error) -> Self {
+        match e.as_db_error() {
+            Some(d) => DbErr(format!("{}: {} ({})", d.severity(), d.message(), d.code().code())),
+            None => DbErr(e.to_string()),
+        }
+    }
+}
+
+impl From<deadpool_postgres::PoolError> for DbErr {
+    fn from(e: deadpool_postgres::PoolError) -> Self {
+        match e {
+            deadpool_postgres::PoolError::Backend(b) => b.into(),
+            other => DbErr(other.to_string()),
+        }
+    }
+}
+
+impl From<deadpool_postgres::BuildError> for DbErr {
+    fn from(e: deadpool_postgres::BuildError) -> Self {
+        DbErr(e.to_string())
+    }
 }
 
 fn interval(d: Duration) -> String {
@@ -65,11 +105,43 @@ impl PgBackend {
         }
         let schema_sql = SCHEMA_SQL.replace("SCHEMA IF NOT EXISTS octopus;", &format!("SCHEMA IF NOT EXISTS {};", cfg.schema)).replace("octopus.", &format!("{}.", cfg.schema));
         if cfg.migrate {
-            // One migrator at a time; the script itself is idempotent.
-            client
-                .batch_execute(&format!("BEGIN; SELECT pg_advisory_xact_lock(hashtext('octopus-migrate')); {schema_sql}; COMMIT;"))
-                .await
-                .map_err(db)?;
+            // The script is idempotent but takes table locks (ALTER TABLE, CREATE INDEX IF NOT EXISTS) that can
+            // deadlock with live traffic, so it runs only when the installed schema differs from this build's: the
+            // hash of the script is kept in <schema>.meta. One migrator at a time.
+            let version = format!("{:016x}", xxhash_rust::xxh3::xxh3_64(schema_sql.as_bytes()));
+            let meta = format!("{}.meta", cfg.schema);
+            let current: Option<String> = match client.query_opt(&format!("SELECT value FROM {meta} WHERE key = 'schema'"), &[]).await {
+                Ok(row) => row.map(|r| r.get(0)),
+                Err(_) => None, // no meta table yet
+            };
+            if current.as_deref() != Some(version.as_str()) {
+                // Under the lock, look again: several members starting together must not each run the script
+                // (the later ones would take its locks while the first is already serving).
+                let migrate = async {
+                    client.batch_execute("BEGIN; SELECT pg_advisory_xact_lock(hashtext('octopus-migrate'))").await?;
+                    let has_meta: bool = client.query_one("SELECT to_regclass($1) IS NOT NULL", &[&meta]).await?.get(0);
+                    let current: Option<String> = if has_meta {
+                        client.query_opt(&format!("SELECT value FROM {meta} WHERE key = 'schema'"), &[]).await?.map(|r| r.get(0))
+                    } else {
+                        None
+                    };
+                    if current.as_deref() != Some(version.as_str()) {
+                        client
+                            .batch_execute(&format!(
+                                "{schema_sql}; \
+                                 CREATE TABLE IF NOT EXISTS {meta} (key text PRIMARY KEY, value text NOT NULL); \
+                                 INSERT INTO {meta} VALUES ('schema', '{version}') \
+                                 ON CONFLICT (key) DO UPDATE SET value = excluded.value"
+                            ))
+                            .await?;
+                    }
+                    client.batch_execute("COMMIT").await
+                };
+                if let Err(e) = migrate.await {
+                    let _ = client.batch_execute("ROLLBACK").await;
+                    return Err(db(e));
+                }
+            }
         }
         // Validate the hooks now (the cast fails for anything that is not an existing function).
         let mut load_sql = None;
@@ -97,30 +169,47 @@ impl PgBackend {
 }
 
 impl Backend for PgBackend {
-    async fn publish(&self, events: &[Event]) -> Result<Vec<PublishOutcome>> {
+    async fn publish(&self, events: &[Event]) -> Result<Vec<Published>> {
         if events.is_empty() {
             return Ok(vec![]);
         }
         let grp: Vec<&str> = events.iter().map(|e| e.group.as_str()).collect();
         let src: Vec<&str> = events.iter().map(|e| e.key.source.as_str()).collect();
-        let seq: Vec<i64> = events.iter().map(|e| e.key.seq).collect();
+        let epoch: Vec<i64> = events.iter().map(|e| e.key.pos.epoch).collect();
+        let seq: Vec<i64> = events.iter().map(|e| e.key.pos.seq).collect();
         let body: Vec<&[u8]> = events.iter().map(|e| e.body.as_ref()).collect();
         let hash: Vec<i64> = events.iter().map(|e| xxhash_rust::xxh3::xxh3_64(&e.body) as i64).collect();
-        if seq.iter().any(|&q| q < 1) {
-            return Err(Error::Invalid("seq starts at 1".into()));
+        let skip_to: Vec<Option<i64>> = events.iter().map(|e| e.skip_to).collect();
+        let prev_epoch: Vec<Option<i64>> = events.iter().map(|e| e.prev.map(|p| p.epoch)).collect();
+        let prev_last: Vec<Option<i64>> = events.iter().map(|e| e.prev.map(|p| p.last_seq)).collect();
+        if events.iter().any(|e| e.key.pos.seq < 1 || e.key.pos.epoch < 0 || e.skip_to.is_some_and(|k| k < e.key.pos.seq)) {
+            return Err(Error::Invalid("seq starts at 1, epoch is not negative, skip_to >= seq".into()));
         }
         let c = self.client().await?;
-        let st = c.prepare_cached(&self.q("SELECT octopus.publish($1, $2, $3, $4, $5)")).await.map_err(db)?;
-        let row = c.query_one(&st, &[&grp, &src, &seq, &body, &hash]).await.map_err(db)?;
+        let st = c
+            .prepare_cached(&self.q("SELECT codes, missing FROM octopus.publish($1, $2, $3, $4, $5, $6, $7, $8, $9)"))
+            .await
+            .map_err(db)?;
+        let row = c
+            .query_one(&st, &[&grp, &src, &epoch, &seq, &body, &hash, &skip_to, &prev_epoch, &prev_last])
+            .await
+            .map_err(db)?;
         let codes: Vec<i16> = row.get(0);
+        let missing: Vec<i64> = row.get(1);
         Ok(codes
             .into_iter()
-            .map(|c| match c {
-                0 => PublishOutcome::Stored,
-                3 => PublishOutcome::StoredHead,
-                2 => PublishOutcome::GroupMismatch,
-                4 => PublishOutcome::Conflict,
-                _ => PublishOutcome::Duplicate,
+            .zip(missing)
+            .map(|(c, m)| Published {
+                outcome: match c {
+                    0 => PublishOutcome::Stored,
+                    3 => PublishOutcome::StoredHead,
+                    2 => PublishOutcome::GroupMismatch,
+                    4 => PublishOutcome::Conflict,
+                    5 => PublishOutcome::StaleEpoch,
+                    6 => PublishOutcome::Late,
+                    _ => PublishOutcome::Duplicate,
+                },
+                missing_below: m,
             })
             .collect())
     }
@@ -134,30 +223,21 @@ impl Backend for PgBackend {
         let exclude: Vec<&str> = requests.iter().flat_map(|r| r.exclude_sources.iter().map(String::as_str)).collect();
         let c = self.client().await?;
         let st = c
-            .prepare_cached(&self.q("SELECT x.grp, x.source, x.seq, x.body, x.attempts, \
-                        (extract(epoch FROM x.enqueued_at) * 1000000)::bigint \
+            .prepare_cached(&self.q("SELECT x.grp, x.source, x.epoch, x.seq, x.body, x.attempts, \
+                        (extract(epoch FROM x.enqueued_at) * 1000000)::bigint, x.skip_to \
                    FROM unnest($1::text[], $2::int[]) AS g(name, n) CROSS JOIN LATERAL ( \
-                        SELECT e.grp, e.source, e.seq, e.body, e.attempts, e.enqueued_at \
+                        SELECT e.grp, s.source, e.epoch, e.seq, e.body, e.attempts, e.enqueued_at, e.skip_to \
                           FROM octopus.source s \
-                          JOIN octopus.event e ON e.source = s.source AND e.seq = s.last_seq + 1 \
+                          JOIN octopus.event e ON e.sid = s.id AND e.epoch = s.epoch AND e.seq = s.last_seq + 1 \
                          WHERE s.grp = g.name AND s.source <> ALL($3::text[]) \
                            AND (e.not_before IS NULL OR e.not_before <= now()) \
-                         ORDER BY e.enqueued_at, e.source \
+                         ORDER BY e.enqueued_at, s.source \
                          LIMIT g.n) x"),
             )
             .await
             .map_err(db)?;
         let rows = c.query(&st, &[&grp, &max, &exclude]).await.map_err(db)?;
-        Ok(rows
-            .into_iter()
-            .map(|r| Head {
-                group: r.get(0),
-                key: EventKey { source: r.get(1), seq: r.get(2) },
-                body: Bytes::from(r.get::<_, Vec<u8>>(3)),
-                attempts: r.get(4),
-                enqueued_at_us: r.get(5),
-            })
-            .collect())
+        Ok(rows.into_iter().map(|r| head_row(&r, 0)).collect())
     }
 
     async fn load_context(&self, heads: &[Head]) -> Result<Vec<Option<Bytes>>> {
@@ -167,7 +247,7 @@ impl Backend for PgBackend {
             return Ok(out);
         }
         let src: Vec<&str> = heads.iter().map(|h| h.key.source.as_str()).collect();
-        let seq: Vec<i64> = heads.iter().map(|h| h.key.seq).collect();
+        let seq: Vec<i64> = heads.iter().map(|h| h.key.pos.seq).collect();
         let body: Vec<&[u8]> = heads.iter().map(|h| h.body.as_ref()).collect();
         let c = self.client().await?;
         let st = c.prepare_cached(sql).await.map_err(db)?;
@@ -185,11 +265,12 @@ impl Backend for PgBackend {
             return Ok(vec![]);
         }
         let src: Vec<&str> = commits.iter().map(|c| c.key.source.as_str()).collect();
-        let seq: Vec<i64> = commits.iter().map(|c| c.key.seq).collect();
+        let epoch: Vec<i64> = commits.iter().map(|c| c.key.pos.epoch).collect();
+        let seq: Vec<i64> = commits.iter().map(|c| c.key.pos.seq).collect();
         let eff: Vec<&[u8]> = commits.iter().map(|c| c.effect.as_ref()).collect();
         let c = self.client().await?;
-        let st = c.prepare_cached(&self.q("SELECT octopus.commit_many($1, $2, $3, $4)")).await.map_err(db)?;
-        let row = c.query_one(&st, &[&src, &seq, &eff, &self.apply_hook]).await.map_err(db)?;
+        let st = c.prepare_cached(&self.q("SELECT octopus.commit_many($1, $2, $3, $4, $5)")).await.map_err(db)?;
+        let row = c.query_one(&st, &[&src, &epoch, &seq, &eff, &self.apply_hook]).await.map_err(db)?;
         let codes: Vec<i16> = row.get(0);
         Ok(codes
             .into_iter()
@@ -206,15 +287,17 @@ impl Backend for PgBackend {
             return Ok(vec![]);
         }
         let src: Vec<&str> = keys.iter().map(|k| k.source.as_str()).collect();
-        let seq: Vec<i64> = keys.iter().map(|k| k.seq).collect();
+        let epoch: Vec<i64> = keys.iter().map(|k| k.pos.epoch).collect();
+        let seq: Vec<i64> = keys.iter().map(|k| k.pos.seq).collect();
         let c = self.client().await?;
         let st = c
             .prepare_cached(&self.q(
-                "SELECT i, rc, next_seq, next_body, next_attempts, next_enqueued_us FROM octopus.remove_next($1, $2) ORDER BY i",
+                "SELECT i, rc, next_epoch, next_seq, next_body, next_attempts, next_enqueued_us, next_skip_to \
+                   FROM octopus.remove_next($1, $2, $3) ORDER BY i",
             ))
             .await
             .map_err(db)?;
-        let rows = c.query(&st, &[&src, &seq]).await.map_err(db)?;
+        let rows = c.query(&st, &[&src, &epoch, &seq]).await.map_err(db)?;
         let mut out: Vec<(CommitOutcome, Option<Head>)> = vec![(CommitOutcome::Gap, None); keys.len()];
         for r in rows {
             let i = r.get::<_, i32>(0) as usize - 1;
@@ -223,27 +306,32 @@ impl Backend for PgBackend {
                 1 => CommitOutcome::Duplicate,
                 _ => CommitOutcome::Gap,
             };
-            let next = r.get::<_, Option<i64>>(2).map(|q| Head {
-                group: String::new(), // filled in by the caller (it knows the source's group)
-                key: EventKey { source: keys[i].source.clone(), seq: q },
-                body: Bytes::from(r.get::<_, Vec<u8>>(3)),
-                attempts: r.get(4),
-                enqueued_at_us: r.get(5),
-            });
+            let next = match (r.get::<_, Option<i64>>(2), r.get::<_, Option<i64>>(3)) {
+                (Some(e), Some(q)) => Some(Head {
+                    group: String::new(), // filled in by the caller (it knows the source's group)
+                    key: EventKey::new(keys[i].source.clone(), Pos::new(e, q)),
+                    body: Bytes::from(r.get::<_, Vec<u8>>(4)),
+                    skip_to: r.get(7),
+                    attempts: r.get(5),
+                    enqueued_at_us: r.get(6),
+                }),
+                _ => None,
+            };
             out[i] = (outcome, next);
         }
         Ok(out)
     }
 
-    async fn advance(&self, cursors: &[(String, i64)]) -> Result<()> {
+    async fn advance(&self, cursors: &[(String, Pos)]) -> Result<()> {
         if cursors.is_empty() {
             return Ok(());
         }
         let src: Vec<&str> = cursors.iter().map(|(s, _)| s.as_str()).collect();
-        let seq: Vec<i64> = cursors.iter().map(|(_, q)| *q).collect();
+        let epoch: Vec<i64> = cursors.iter().map(|(_, p)| p.epoch).collect();
+        let seq: Vec<i64> = cursors.iter().map(|(_, p)| p.seq).collect();
         let c = self.client().await?;
-        let st = c.prepare_cached(&self.q("SELECT octopus.advance($1, $2)")).await.map_err(db)?;
-        c.query_one(&st, &[&src, &seq]).await.map_err(db)?;
+        let st = c.prepare_cached(&self.q("SELECT octopus.advance($1, $2, $3)")).await.map_err(db)?;
+        c.execute(&st, &[&src, &epoch, &seq]).await.map_err(db)?;
         Ok(())
     }
 
@@ -252,40 +340,54 @@ impl Backend for PgBackend {
             return Ok(vec![]);
         }
         let src: Vec<&str> = keys.iter().map(|k| k.source.as_str()).collect();
-        let seq: Vec<i64> = keys.iter().map(|k| k.seq).collect();
+        let epoch: Vec<i64> = keys.iter().map(|k| k.pos.epoch).collect();
+        let seq: Vec<i64> = keys.iter().map(|k| k.pos.seq).collect();
         let c = self.client().await?;
         let st = c
             .prepare_cached(&self.q(
-                "SELECT e.grp, e.source, e.seq, e.body, e.attempts, (extract(epoch FROM e.enqueued_at) * 1000000)::bigint \
-                   FROM unnest($1::text[], $2::bigint[]) AS k(s, q) \
-                   JOIN octopus.event e ON e.source = k.s AND e.seq = k.q \
-                  WHERE e.not_before IS NULL OR e.not_before <= now()",
+                // one index lookup per key (LATERAL): a generic plan must not turn this into a scan
+                "SELECT x.grp, k.s, x.epoch, x.seq, x.body, x.attempts, x.enq, x.skip_to \
+                   FROM unnest($1::text[], $2::bigint[], $3::bigint[]) AS k(s, ep, q) \
+                   CROSS JOIN LATERAL ( \
+                        SELECT e.grp, e.epoch, e.seq, e.body, e.attempts, \
+                               (extract(epoch FROM e.enqueued_at) * 1000000)::bigint AS enq, e.skip_to \
+                          FROM octopus.source s JOIN octopus.event e ON e.sid = s.id \
+                         WHERE s.source = k.s AND e.epoch = k.ep AND e.seq = k.q \
+                           AND (e.not_before IS NULL OR e.not_before <= now())) x",
             ))
             .await
             .map_err(db)?;
-        let rows = c.query(&st, &[&src, &seq]).await.map_err(db)?;
-        Ok(rows
-            .into_iter()
-            .map(|r| Head {
-                group: r.get(0),
-                key: EventKey { source: r.get(1), seq: r.get(2) },
-                body: Bytes::from(r.get::<_, Vec<u8>>(3)),
-                attempts: r.get(4),
-                enqueued_at_us: r.get(5),
-            })
-            .collect())
+        let rows = c.query(&st, &[&src, &epoch, &seq]).await.map_err(db)?;
+        Ok(rows.into_iter().map(|r| head_row(&r, 0)).collect())
     }
 
     async fn fail(&self, key: &EventKey, delay: Duration) -> Result<()> {
         let c = self.client().await?;
         let st = c
-            .prepare_cached(&self.q("UPDATE octopus.event SET attempts = attempts + 1, not_before = now() + $3::text::interval \
-                  WHERE source = $1 AND seq = $2"),
+            .prepare_cached(&self.q("UPDATE octopus.event e SET attempts = e.attempts + 1, not_before = now() + $4::text::interval \
+                  FROM octopus.source s WHERE s.source = $1 AND e.sid = s.id AND e.epoch = $2 AND e.seq = $3"),
             )
             .await
             .map_err(db)?;
-        c.execute(&st, &[&key.source, &key.seq, &interval(delay)]).await.map_err(db)?;
+        c.execute(&st, &[&key.source, &key.pos.epoch, &key.pos.seq, &interval(delay)]).await.map_err(db)?;
         Ok(())
+    }
+
+    async fn skip(&self, source: &str, after: Pos, to_seq: Option<i64>, reason: &str) -> Result<Option<(Pos, Skipped)>> {
+        let c = self.client().await?;
+        let row = c
+            .query_one(&self.q("SELECT new_epoch, new_seq, from_seq, to_seq FROM octopus.skip($1, $2, $3, $4, $5)"),
+                &[&source, &after.epoch, &after.seq, &to_seq, &reason],
+            )
+            .await
+            .map_err(db)?;
+        Ok(match (row.get::<_, Option<i64>>(0), row.get::<_, Option<i64>>(1)) {
+            (Some(e), Some(q)) => Some((
+                Pos::new(e, q),
+                Skipped { epoch: after.epoch, from_seq: row.get::<_, Option<i64>>(2).unwrap_or(after.seq + 1), to_seq: row.get(3) },
+            )),
+            _ => None,
+        })
     }
 
     async fn groups(&self) -> Result<Vec<String>> {
@@ -297,7 +399,8 @@ impl Backend for PgBackend {
     async fn backlog(&self) -> Result<i64> {
         let c = self.client().await?;
         let row = c
-            .query_one(&self.q("SELECT count(*) FROM octopus.event e JOIN octopus.source s ON s.source = e.source WHERE e.seq > s.last_seq"),
+            .query_one(&self.q("SELECT count(*) FROM octopus.event e JOIN octopus.source s ON s.id = e.sid \
+                    WHERE (e.epoch, e.seq) > (s.epoch, s.last_seq)"),
                 &[],
             )
             .await
@@ -373,14 +476,19 @@ impl Backend for PgBackend {
         }
         let older_us = older_than.as_micros().min(i64::MAX as u128) as i64;
         let c = self.client().await?;
+        // sources with something stored beyond the cursor but no head; the first stored position tells the gap
         let st = c
-            .prepare_cached(&self.q("SELECT s.grp, s.source, s.last_seq, min(e.seq), \
-                        (extract(epoch FROM now() - min(e.enqueued_at)) * 1000000)::bigint \
-                   FROM octopus.source s JOIN octopus.event e ON e.source = s.source AND e.seq > s.last_seq \
+            .prepare_cached(&self.q("SELECT s.grp, s.source, s.epoch, s.last_seq, \
+                        (array_agg(e.epoch ORDER BY e.epoch, e.seq))[1], (array_agg(e.seq ORDER BY e.epoch, e.seq))[1], \
+                        (extract(epoch FROM now() - min(e.enqueued_at)) * 1000000)::bigint, min(g.gap_skip_ms) \
+                   FROM octopus.source s \
+                   JOIN octopus.event e ON e.sid = s.id AND (e.epoch, e.seq) > (s.epoch, s.last_seq) \
+                   JOIN octopus.grp g ON g.name = s.grp \
                   WHERE s.grp = ANY($1) \
-                  GROUP BY s.grp, s.source, s.last_seq \
-                 HAVING min(e.seq) > s.last_seq + 1 AND min(e.enqueued_at) < now() - $2::bigint * interval '1 microsecond' \
-                  ORDER BY 5 DESC LIMIT $3::int"))
+                  GROUP BY s.grp, s.source, s.epoch, s.last_seq \
+                 HAVING NOT bool_or(e.epoch = s.epoch AND e.seq = s.last_seq + 1) \
+                    AND min(e.enqueued_at) < now() - $2::bigint * interval '1 microsecond' \
+                  ORDER BY 7 DESC LIMIT $3::int"))
             .await
             .map_err(db)?;
         let rows = c.query(&st, &[&groups, &older_us, &limit]).await.map_err(db)?;
@@ -389,9 +497,10 @@ impl Backend for PgBackend {
             .map(|r| Gap {
                 group: r.get(0),
                 source: r.get(1),
-                cursor: r.get(2),
-                first_stored: r.get(3),
-                waiting: Duration::from_micros(r.get::<_, i64>(4).max(0) as u64),
+                cursor: Pos::new(r.get(2), r.get(3)),
+                first_stored: Pos::new(r.get(4), r.get(5)),
+                waiting: Duration::from_micros(r.get::<_, i64>(6).max(0) as u64),
+                gap_skip_ms: r.get(7),
             })
             .collect())
     }

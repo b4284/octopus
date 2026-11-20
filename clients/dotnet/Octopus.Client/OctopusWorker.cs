@@ -5,7 +5,11 @@ using Octopus.V1;
 
 namespace Octopus.Client;
 
-/// <summary>A delivery as handed to the application. (Source, Seq) is the idempotency key for external calls.</summary>
+/// <summary>
+/// A delivery as handed to the application. (Source, Epoch, Seq) is the idempotency key for external calls.
+/// <c>Item.Skipped</c> lists positions of the source given up since its previous delivery (lost; declared by the
+/// source or skipped after the gap timeout): the application may resynchronise or flag the record.
+/// </summary>
 public sealed class OctopusDelivery
 {
     public required Delivery Item { get; init; }
@@ -80,7 +84,7 @@ public sealed class OctopusWorker : IAsyncDisposable
     /// <summary>Commit the event with this effect (passed to the apply hook). Returns what the database decided.</summary>
     public async Task<ResultStatus> CompleteAsync(OctopusDelivery d, ByteString effect, CancellationToken ct = default)
     {
-        var r = new WorkResult { RequestId = _conn.NextRequestId(), Group = d.Item.Group, Source = d.Item.Source, Seq = d.Item.Seq, Ok = true, Effect = effect, WorkerId = _id };
+        var r = new WorkResult { RequestId = _conn.NextRequestId(), Group = d.Item.Group, Source = d.Item.Source, Epoch = d.Item.Epoch, Seq = d.Item.Seq, Ok = true, Effect = effect, WorkerId = _id };
         var tcs = new TaskCompletionSource<ResultStatus>(TaskCreationOptions.RunContinuationsAsynchronously);
         _conn.PendingResults[r.RequestId] = tcs;
         try
@@ -98,7 +102,7 @@ public sealed class OctopusWorker : IAsyncDisposable
     /// </summary>
     public void ReportDone(OctopusDelivery d)
     {
-        var r = new WorkResult { RequestId = _conn.NextRequestId(), Group = d.Item.Group, Source = d.Item.Source, Seq = d.Item.Seq, Ok = true, Done = true, WorkerId = _id };
+        var r = new WorkResult { RequestId = _conn.NextRequestId(), Group = d.Item.Group, Source = d.Item.Source, Epoch = d.Item.Epoch, Seq = d.Item.Seq, Ok = true, Done = true, WorkerId = _id };
         SendResult(d, r);
     }
 
@@ -110,7 +114,7 @@ public sealed class OctopusWorker : IAsyncDisposable
     {
         var r = new WorkResult
         {
-            RequestId = _conn.NextRequestId(), Group = d.Item.Group, Source = d.Item.Source, Seq = d.Item.Seq,
+            RequestId = _conn.NextRequestId(), Group = d.Item.Group, Source = d.Item.Source, Epoch = d.Item.Epoch, Seq = d.Item.Seq,
             Ok = false, RetryDelayMs = (uint)Math.Clamp(retryDelay.TotalMilliseconds, 1, uint.MaxValue), WorkerId = _id,
         };
         SendResult(d, r);

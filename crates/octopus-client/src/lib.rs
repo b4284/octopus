@@ -28,7 +28,16 @@ pub enum Error {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
-pub use v1::{Delivery, PublishItem, PublishStatus};
+pub use v1::{Delivery, PublishItem, PublishStatus, Skipped};
+
+/// What Octopus answered for one published item.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Ack {
+    pub status: PublishStatus,
+    /// Positions directly below this one (same epoch) that are neither stored nor applied. If the producer still
+    /// has them in flight, nothing to do; if it lost them, it replays them or publishes a skip marker.
+    pub missing_below: i64,
+}
 
 fn envelope(body: Body) -> Bytes {
     Bytes::from(v1::Envelope { body: Some(body) }.encode_to_vec())
@@ -95,8 +104,8 @@ impl Producer {
         Ok(p)
     }
 
-    /// Publishes and returns one status per item, once the events are committed. Retries until acknowledged.
-    pub async fn publish(&self, items: Vec<PublishItem>) -> Result<Vec<PublishStatus>> {
+    /// Publishes and returns one answer per item, once the events are committed. Retries until acknowledged.
+    pub async fn publish(&self, items: Vec<PublishItem>) -> Result<Vec<Ack>> {
         let Some(first) = items.first() else { return Ok(vec![]) };
         let topic = self.topics.publish(&first.group);
         let mut req = v1::PublishRequest { reply_to: self.inbox.clone(), request_id: 0, items };
@@ -132,7 +141,15 @@ impl Producer {
             }
             match tokio::time::timeout(self.reply_timeout, rx).await {
                 Ok(Ok(r)) if r.error.is_empty() => {
-                    return Ok(r.status.into_iter().map(|s| PublishStatus::try_from(s).unwrap_or(PublishStatus::Unspecified)).collect());
+                    return Ok(r
+                        .status
+                        .iter()
+                        .enumerate()
+                        .map(|(i, s)| Ack {
+                            status: PublishStatus::try_from(*s).unwrap_or(PublishStatus::Unspecified),
+                            missing_below: r.missing_below.get(i).copied().unwrap_or(0),
+                        })
+                        .collect());
                 }
                 Ok(Ok(r)) if r.error.starts_with("invalid") => return Err(Error::Rejected(r.error)),
                 Ok(Ok(r)) => debug!(attempt, error = %r.error, "publish failed; retrying"),
@@ -389,9 +406,10 @@ impl<H: Handler> Worker<H> {
             let me = self.clone();
             let (member, member_inbox) = (d.member_id.clone(), d.inbox.clone());
             tokio::spawn(async move {
-                let (group, source, seq) = (item.group.clone(), item.source.clone(), item.seq);
+                let (group, source, epoch, seq) = (item.group.clone(), item.source.clone(), item.epoch, item.seq);
                 let outcome = me.handler.handle(item).await;
-                let mut r = v1::WorkResult { request_id: me.next_req.fetch_add(1, Relaxed), group, source: source.clone(), seq, ..Default::default() };
+                let mut r =
+                    v1::WorkResult { request_id: me.next_req.fetch_add(1, Relaxed), group, source: source.clone(), epoch, seq, ..Default::default() };
                 match outcome {
                     Outcome::Vanish => {
                         me.state.lock().unwrap().running.remove(&id);

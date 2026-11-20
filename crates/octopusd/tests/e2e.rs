@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use octopus_client::{Delivery, Handler, Outcome, Producer, PublishItem, Worker, WorkerConfig};
+use octopus_client::{Delivery, Handler, Outcome, Producer, PublishItem, PublishStatus, Worker, WorkerConfig};
 use octopus_fabric::MqttConfig;
 use tokio::sync::watch;
 
@@ -53,9 +53,16 @@ impl Dispatcher {
     }
 
     fn start_with(ns: &str, member: &str, apply_hook: Option<&str>) -> Self {
+        Self::start_env(ns, member, apply_hook, &[])
+    }
+
+    fn start_env(ns: &str, member: &str, apply_hook: Option<&str>, extra: &[(&str, &str)]) -> Self {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_octopusd"));
         if let Some(h) = apply_hook {
             cmd.env("OCTOPUS_APPLY_HOOK", h);
+        }
+        for (k, v) in extra {
+            cmd.env(k, v);
         }
         let child = cmd
             .env("OCTOPUS_MEMBER_ID", member)
@@ -149,7 +156,7 @@ async fn publish_all(ns: &str, groups: &[String], sources: &[String], seqs: i64)
         let (p, s, g) = (producer.clone(), s.clone(), groups[i % groups.len()].clone());
         tasks.push(tokio::spawn(async move {
             for q in 1..=seqs {
-                let item = PublishItem { group: g.clone(), source: s.clone(), seq: q, body: Bytes::from(format!("{s}/{q}")) };
+                let item = PublishItem { group: g.clone(), source: s.clone(), seq: q, body: Bytes::from(format!("{s}/{q}")), epoch: 1, ..Default::default() };
                 p.publish(vec![item.clone()]).await.expect("publish");
                 if q % 7 == 0 {
                     p.publish(vec![item]).await.expect("republish");
@@ -196,7 +203,10 @@ async fn setup(ns: &str, groups: usize, sources: usize) -> (Vec<String>, Vec<Str
 async fn backlog(schema: &str) -> i64 {
     let c = db().await;
     let r = c
-        .query_one(&format!("SELECT count(*) FROM {schema}.event e JOIN {schema}.source s USING (source) WHERE e.seq > s.last_seq"), &[])
+        .query_one(
+            &format!("SELECT count(*) FROM {schema}.event e JOIN {schema}.source s ON s.id = e.sid WHERE (e.epoch, e.seq) > (s.epoch, s.last_seq)"),
+            &[],
+        )
         .await
         .unwrap();
     r.get(0)
@@ -388,7 +398,7 @@ async fn events_published_out_of_order_lost_and_repeated_are_handed_out_in_order
             if late {
                 tokio::time::sleep(Duration::from_secs(3)).await;
             }
-            let item = PublishItem { group: g, source: s.clone(), seq: q, body: Bytes::from(format!("{s}/{q}")) };
+            let item = PublishItem { group: g, source: s.clone(), seq: q, body: Bytes::from(format!("{s}/{q}")), epoch: 1, ..Default::default() };
             p.publish(vec![item.clone()]).await.expect("publish");
             if q % 7 == 0 {
                 p.publish(vec![item]).await.expect("republish");
@@ -414,4 +424,65 @@ async fn events_published_out_of_order_lost_and_repeated_are_handed_out_in_order
     for w in workers {
         let _ = w.await;
     }
+}
+
+
+/// Records every delivery: (source, epoch, seq, skipped ranges as (epoch, from, to or -1)).
+struct Recorder(Arc<Mutex<Vec<(String, i64, i64, Vec<(i64, i64, i64)>)>>>);
+
+impl Handler for Recorder {
+    async fn handle(&self, d: Delivery) -> Outcome {
+        let skipped = d.skipped.iter().map(|k| (k.epoch, k.from_seq, k.to_seq.unwrap_or(-1))).collect();
+        self.0.lock().unwrap().push((d.source.clone(), d.epoch, d.seq, skipped));
+        Outcome::Done
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn skips_epochs_and_gap_timeouts_reach_the_worker_in_order() {
+    let ns = uniq("e2e");
+    let (groups, _) = setup(&ns, 1, 0).await;
+    let g = groups[0].clone();
+    let _d = Dispatcher::start_env(&ns, "d1", None, &[("OCTOPUS_GAP_SKIP_MS", "1500"), ("OCTOPUS_GAP_CHECK_MS", "300"), ("OCTOPUS_GAP_ALERT_MS", "1000")]);
+    let (stop_tx, stop_rx) = watch::channel(false);
+    let seen = Arc::new(Mutex::new(vec![]));
+    let id = format!("{ns}-w");
+    let (w, rx) = Worker::connect(MqttConfig::new("127.0.0.1", 1883, id.clone()), WorkerConfig::new(id, ns.clone(), groups.clone(), 4), Recorder(seen.clone()))
+        .await
+        .unwrap();
+    let worker = tokio::spawn(w.run(rx, stop_rx.clone()));
+    let producer = Producer::connect(MqttConfig::new("127.0.0.1", 1883, format!("{ns}-p")), &ns, &format!("{ns}-p")).await.unwrap();
+    let item = |s: &str, epoch: i64, seq: i64| PublishItem { group: g.clone(), source: format!("{ns}-{s}"), epoch, seq, body: Bytes::from(format!("{s}/{epoch}/{seq}")), ..Default::default() };
+    // A: the source declares 2..=3 lost
+    let mut marker = item("a", 1, 2);
+    marker.skip_to = Some(3);
+    producer.publish(vec![item("a", 1, 1), marker, item("a", 1, 4)]).await.unwrap();
+    // B: 2 never comes (skipped after the gap timeout); the acknowledgement of 3 says one is missing below it
+    let acks = producer.publish(vec![item("b", 1, 1), item("b", 1, 3)]).await.unwrap();
+    assert_eq!(acks[1].missing_below, 1);
+    // C: a new epoch that declares where the previous one ended
+    let mut first = item("c", 2, 1);
+    first.prev_epoch = Some(1);
+    first.prev_last_seq = Some(1);
+    producer.publish(vec![item("c", 1, 1), first, item("c", 2, 2)]).await.unwrap();
+    // D: a new epoch without a declared end (the old one is closed after the gap timeout)
+    producer.publish(vec![item("d", 1, 1), item("d", 2, 1), item("d", 2, 2)]).await.unwrap();
+
+    let want = 2 + 2 + 3 + 3;
+    let until = Instant::now() + Duration::from_secs(20);
+    while seen.lock().unwrap().len() < want {
+        assert!(Instant::now() < until, "only {:?}", seen.lock().unwrap());
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let per = |s: &str| -> Vec<(i64, i64, Vec<(i64, i64, i64)>)> {
+        seen.lock().unwrap().iter().filter(|r| r.0 == format!("{ns}-{s}")).map(|r| (r.1, r.2, r.3.clone())).collect()
+    };
+    assert_eq!(per("a"), vec![(1, 1, vec![]), (1, 4, vec![(1, 2, 3)])]);
+    assert_eq!(per("b"), vec![(1, 1, vec![]), (1, 3, vec![(1, 2, 2)])]);
+    assert_eq!(per("c"), vec![(1, 1, vec![]), (2, 1, vec![]), (2, 2, vec![])]);
+    assert_eq!(per("d"), vec![(1, 1, vec![]), (2, 1, vec![(1, 2, -1)]), (2, 2, vec![])]);
+    // the lost event of B turns up after all: too late
+    assert_eq!(producer.publish(vec![item("b", 1, 2)]).await.unwrap()[0].status, PublishStatus::PublishLate);
+    let _ = stop_tx.send(true);
+    let _ = worker.await;
 }

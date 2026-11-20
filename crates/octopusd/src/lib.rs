@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use octopus_core::{Backend, Commit, CommitOutcome, Event, EventKey, Head, HeadRequest, Member, PublishOutcome};
+use octopus_core::{Backend, Commit, CommitOutcome, EpochEnd, Event, EventKey, Head, HeadRequest, Member, Pos, PublishOutcome, Skipped};
 use octopus_fabric::{Fabric, Incoming};
 use octopus_proto::v1::{self, envelope::Body};
 use octopus_proto::{Message, Topics, valid_name};
@@ -47,6 +47,8 @@ pub struct Config {
     pub gap_alert: Duration,
     /// Look for gaps this often.
     pub gap_check: Duration,
+    /// Skip a gap after this long, for groups without their own policy (`grp.gap_skip_ms`). None: never.
+    pub gap_skip: Option<Duration>,
     /// Hand out events known to be heads (from publishes and "done" removals) without reading the group's heads.
     /// Off when contexts are preloaded by a load hook (the fast path has no context).
     pub fast_path: bool,
@@ -73,6 +75,7 @@ impl Config {
             stats_every: Duration::from_secs(5),
             gap_alert: Duration::from_secs(30),
             gap_check: Duration::from_secs(10),
+            gap_skip: None,
             fast_path: true,
         }
     }
@@ -90,7 +93,7 @@ struct ReadyHead {
 const LONG_OUTSTANDING: Duration = Duration::from_secs(60);
 
 struct InFlight {
-    seq: i64,
+    pos: Pos,
     /// The worker it was handed to: only its progress reports extend the deadline, and only its failure reports
     /// give the event back (a late report from an earlier holder must not cancel the current delivery).
     worker: String,
@@ -113,20 +116,22 @@ struct GroupState {
     last_fetch: Option<Instant>,
     /// Events this dispatcher handed out whose outcome is unknown (timed out, or "done" hit a database error):
     /// a repeat must carry possibly_redelivered.
-    suspect: HashSet<(String, i64)>,
+    suspect: HashSet<(String, Pos)>,
     /// Events stored before this instant (Unix µs, with slack) may have been handed out by the previous owner.
     claimed_us: i64,
     last_demand: Option<Instant>,
-    /// source -> last seq known removed by this owner (stale hints are ignored)
-    cursor: HashMap<String, i64>,
-    /// source -> highest seq known stored
-    known_max: HashMap<String, i64>,
+    /// source -> last position known done by this owner (stale hints are ignored)
+    cursor: HashMap<String, Pos>,
+    /// source -> highest position known stored
+    known_max: HashMap<String, Pos>,
     /// source -> bodies of its stored events that are not heads yet (from publishes and hints), so the next one can
-    /// be handed out the moment its predecessor is reported done
-    pending: HashMap<String, std::collections::BTreeMap<i64, (Bytes, i64)>>,
+    /// be handed out the moment its predecessor is reported done: position -> (body, enqueued µs, skip_to)
+    pending: HashMap<String, std::collections::BTreeMap<Pos, (Bytes, i64, Option<i64>)>>,
     pending_count: usize,
     /// source -> the event to look up by key (its next one, not in memory); retried until found
-    want: HashMap<String, i64>,
+    want: HashMap<String, Pos>,
+    /// source -> positions skipped since its last delivery (told to the worker with the next one)
+    skipped: HashMap<String, Vec<Skipped>>,
     want_fetching: bool,
     last_want_fetch: Option<Instant>,
 }
@@ -148,7 +153,7 @@ impl GroupState {
         let s = &head.key.source;
         if !self.serving
             || self.inflight.contains_key(s)
-            || self.cursor.get(s).is_some_and(|c| *c >= head.key.seq)
+            || self.cursor.get(s).is_some_and(|c| *c >= head.key.pos)
             || self.ready.iter().any(|r| r.head.key.source == *s)
         {
             return false;
@@ -157,31 +162,33 @@ impl GroupState {
         true
     }
 
-    /// A worker reported `seq` of `source` done: it has committed its writes, so the source is free and its next
+    /// A worker reported `pos` of `source` done: it has committed its writes, so the source is free and its next
     /// event can go out now (the removal from the database follows). Returns whether a next event was queued.
-    fn done(&mut self, group: &str, source: &str, seq: i64) -> bool {
-        if self.inflight.get(source).is_some_and(|f| f.seq == seq) {
+    /// (The next event of a new epoch is never taken from memory: only the database knows where the old epoch
+    /// ended. The fallback head read finds it once the cursor is written.)
+    fn done(&mut self, group: &str, source: &str, pos: Pos) -> bool {
+        if self.inflight.get(source).is_some_and(|f| f.pos == pos) {
             self.inflight.remove(source);
         }
-        self.suspect.remove(&(source.to_owned(), seq));
-        let c = self.cursor.entry(source.to_owned()).or_insert(0);
-        *c = (*c).max(seq);
+        self.suspect.remove(&(source.to_owned(), pos));
+        let c = self.cursor.entry(source.to_owned()).or_default();
+        *c = (*c).max(pos);
         let Some(p) = self.pending.get_mut(source) else {
-            self.want.insert(source.to_owned(), seq + 1);
+            self.want.insert(source.to_owned(), pos.next());
             return false;
         };
         // forget what is done, then take the next one if we hold it
         while let Some((&q, _)) = p.first_key_value() {
-            if q > seq {
+            if q > pos {
                 break;
             }
             p.pop_first();
             self.pending_count -= 1;
         }
         let next = match p.first_key_value() {
-            Some((&q, _)) if q == seq + 1 => p.pop_first().map(|(q, (body, enq))| {
+            Some((&q, _)) if q == pos.next() => p.pop_first().map(|(q, (body, enq, skip_to))| {
                 self.pending_count -= 1;
-                Head { group: group.to_owned(), key: EventKey { source: source.to_owned(), seq: q }, body, attempts: 0, enqueued_at_us: enq }
+                Head { group: group.to_owned(), key: EventKey::new(source, q), body, skip_to, attempts: 0, enqueued_at_us: enq }
             }),
             _ => None,
         };
@@ -191,7 +198,7 @@ impl GroupState {
         match next {
             Some(h) => self.offer(h),
             None => {
-                self.want.insert(source.to_owned(), seq + 1);
+                self.want.insert(source.to_owned(), pos.next());
                 false
             }
         }
@@ -200,8 +207,9 @@ impl GroupState {
     /// Events stored for this group (by this dispatcher or, via a hint, another one).
     fn stored(&mut self, group: &str, events: Vec<v1::HintEvent>, fast_path: bool) {
         for e in events {
-            let m = self.known_max.entry(e.source.clone()).or_insert(0);
-            *m = (*m).max(e.seq);
+            let pos = Pos::new(e.epoch, e.seq);
+            let m = self.known_max.entry(e.source.clone()).or_default();
+            *m = (*m).max(pos);
             if !fast_path {
                 self.dirty = true;
                 continue;
@@ -211,33 +219,35 @@ impl GroupState {
                     Some(body) => {
                         let head = Head {
                             group: group.to_owned(),
-                            key: EventKey { source: e.source, seq: e.seq },
+                            key: EventKey::new(e.source, pos),
                             body,
+                            skip_to: e.skip_to,
                             attempts: 0,
                             enqueued_at_us: e.enqueued_us,
                         };
                         self.offer(head);
                     }
                     None => {
-                        self.want.insert(e.source, e.seq);
+                        self.want.insert(e.source, pos);
                     }
                 }
-            } else if self.cursor.get(&e.source) == Some(&(e.seq - 1)) && !self.inflight.contains_key(&e.source) {
+            } else if self.cursor.get(&e.source).map(|c| c.next()) == Some(pos) && !self.inflight.contains_key(&e.source) {
                 // stored while its predecessor was being removed: it is the head now
                 match e.body {
                     Some(body) => {
-                        let head = Head { group: group.to_owned(), key: EventKey { source: e.source, seq: e.seq }, body, attempts: 0, enqueued_at_us: e.enqueued_us };
+                        let head =
+                            Head { group: group.to_owned(), key: EventKey::new(e.source, pos), body, skip_to: e.skip_to, attempts: 0, enqueued_at_us: e.enqueued_us };
                         self.offer(head);
                     }
                     None => {
-                        self.want.insert(e.source, e.seq);
+                        self.want.insert(e.source, pos);
                     }
                 }
             } else if let Some(body) = e.body {
                 // not the head yet: keep its body for the moment its predecessor is reported done
-                if self.pending_count < PENDING_MAX_PER_GROUP && self.cursor.get(&e.source).is_none_or(|c| *c < e.seq) {
+                if self.pending_count < PENDING_MAX_PER_GROUP && self.cursor.get(&e.source).is_none_or(|c| *c < pos) {
                     let p = self.pending.entry(e.source).or_default();
-                    if p.insert(e.seq, (body, e.enqueued_us)).is_none() {
+                    if p.insert(pos, (body, e.enqueued_us, e.skip_to)).is_none() {
                         self.pending_count += 1;
                     }
                 }
@@ -282,7 +292,9 @@ struct Core {
     /// Hand out nothing after this instant unless the leases were renewed (local lease deadline).
     lease_deadline: Option<Instant>,
     /// Cursors moved by "done" reports and not yet written to the database (flushed every ~100 ms).
-    unflushed: HashMap<String, i64>,
+    unflushed: HashMap<String, Pos>,
+    /// Position ranges skipped so far (source markers consumed here, gaps given up after the timeout).
+    skips: u64,
 }
 
 impl Core {
@@ -316,8 +328,23 @@ impl Core {
         if !self.handing_out(now) {
             return (vec![], vec![]);
         }
-        let Core { groups, workers, by_group, .. } = self;
+        let Core { groups, workers, by_group, unflushed, skips, .. } = self;
         for (g, st) in groups.iter_mut().filter(|(_, st)| st.serving && !st.ready.is_empty()) {
+            // skip markers are never handed out: the cursor jumps over the declared range (written with the next
+            // flush, which records the skip), the worker hears of it with the source's next delivery
+            while let Some(i) = st.ready.iter().position(|r| r.head.skip_to.is_some()) {
+                let r = st.ready.remove(i).unwrap();
+                let (source, from) = (r.head.key.source, r.head.key.pos);
+                let to = Pos::new(from.epoch, r.head.skip_to.unwrap_or(from.seq).max(from.seq));
+                st.skipped.entry(source.clone()).or_default().push(Skipped { epoch: from.epoch, from_seq: from.seq, to_seq: Some(to.seq) });
+                let u = unflushed.entry(source.clone()).or_default();
+                *u = (*u).max(to);
+                *skips += 1;
+                st.done(g, &source, to);
+            }
+            if st.ready.is_empty() {
+                continue;
+            }
             let Some(ws) = by_group.get(g) else { continue };
             let credited = ws.iter().any(|w| workers.get(w).is_some_and(|x| x.usable()));
             if !credited {
@@ -353,19 +380,28 @@ impl Core {
                 let w = workers.get_mut(&wid).unwrap();
                 w.credit -= 1;
                 w.held += 1;
-                st.inflight.insert(r.head.key.source.clone(), InFlight { seq: r.head.key.seq, worker: wid.clone(), deadline: now + timeout, since: now, warned: false });
+                st.inflight.insert(r.head.key.source.clone(), InFlight { pos: r.head.key.pos, worker: wid.clone(), deadline: now + timeout, since: now, warned: false });
                 let possibly_redelivered =
-                    st.suspect.contains(&(r.head.key.source.clone(), r.head.key.seq)) || r.head.enqueued_at_us <= st.claimed_us;
+                    st.suspect.contains(&(r.head.key.source.clone(), r.head.key.pos)) || r.head.enqueued_at_us <= st.claimed_us;
+                let skipped = st
+                    .skipped
+                    .remove(&r.head.key.source)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|k| v1::Skipped { epoch: k.epoch, from_seq: k.from_seq, to_seq: k.to_seq })
+                    .collect();
                 out.entry(w.inbox.clone()).or_default().push(v1::Delivery {
                     group: r.head.group,
                     source: r.head.key.source,
-                    seq: r.head.key.seq,
+                    seq: r.head.key.pos.seq,
+                    epoch: r.head.key.pos.epoch,
                     body: r.head.body,
                     context: r.context,
                     attempts: r.head.attempts,
                     enqueued_us: r.head.enqueued_at_us,
                     worker_id: wid.clone(),
                     possibly_redelivered,
+                    skipped,
                 });
             }
         }
@@ -389,7 +425,7 @@ impl Core {
             want.retain(|s, q| !inflight.contains_key(s) && cursor.get(s).is_none_or(|c| *c < *q));
             for (s, q) in want.iter() {
                 if !ready.iter().any(|r| r.head.key.source == *s) {
-                    keys.push((g.clone(), EventKey { source: s.clone(), seq: *q }));
+                    keys.push((g.clone(), EventKey::new(s.clone(), *q)));
                 }
             }
             if !st.want.is_empty() {
@@ -435,6 +471,10 @@ pub struct Stats {
     pub publish_duplicates: AtomicU64,
     /// publishes rejected because the (source, seq) is stored with a different body
     pub publish_conflicts: AtomicU64,
+    /// publishes rejected as from a stale epoch (fencing)
+    pub publish_stale_epoch: AtomicU64,
+    /// publishes of positions skipped before they arrived
+    pub publish_late: AtomicU64,
     pub publish_batches: AtomicU64,
     pub applied: AtomicU64,
     /// "done" reports for events the worker already completed in its own transaction
@@ -646,15 +686,15 @@ impl<B: Backend> Dispatcher<B> {
                             if it.ok && it.done && self.cfg.fast_path {
                                 let Core { groups, workers, .. } = &mut *core;
                                 if let Some(st) = groups.get_mut(&it.group) {
-                                    if let Some(f) = st.inflight.get(&it.source).filter(|f| f.seq == it.seq) {
+                                    if let Some(f) = st.inflight.get(&it.source).filter(|f| f.pos == Pos::new(it.epoch, it.seq)) {
                                         let w = f.worker.clone();
                                         st.inflight.remove(&it.source);
                                         unhold(workers, &w);
                                     }
-                                    st.done(&it.group, &it.source, it.seq);
+                                    st.done(&it.group, &it.source, Pos::new(it.epoch, it.seq));
                                 }
-                                let c = core.unflushed.entry(it.source.clone()).or_insert(0);
-                                *c = (*c).max(it.seq);
+                                let c = core.unflushed.entry(it.source.clone()).or_default();
+                                *c = (*c).max(Pos::new(it.epoch, it.seq));
                                 self.stats.applied.fetch_add(1, Relaxed);
                             }
                         }
@@ -670,7 +710,7 @@ impl<B: Backend> Dispatcher<B> {
                             if it.ok {
                                 return true;
                             }
-                            let stale = core.groups.get(&it.group).and_then(|st| st.inflight.get(&it.source)).is_some_and(|f| f.seq != it.seq || f.worker != it.worker_id);
+                            let stale = core.groups.get(&it.group).and_then(|st| st.inflight.get(&it.source)).is_some_and(|f| f.pos != Pos::new(it.epoch, it.seq) || f.worker != it.worker_id);
                             if stale {
                                 self.stats.stale_failures.fetch_add(1, Relaxed);
                             }
@@ -788,14 +828,24 @@ impl<B: Backend> Dispatcher<B> {
         let mut events = vec![];
         let mut bad = vec![false; batch.len()];
         for (i, p) in batch.iter().enumerate() {
-            if p.items.iter().any(|it| !valid_name(&it.group) || it.source.is_empty() || it.seq < 1) {
+            if p.items.iter().any(|it| {
+                !valid_name(&it.group)
+                    || it.source.is_empty()
+                    || it.seq < 1
+                    || it.epoch < 0
+                    || it.skip_to.is_some_and(|k| k < it.seq)
+                    || it.prev_epoch.is_some_and(|e| e < 0 || e >= it.epoch)
+                    || it.prev_epoch.is_some() != it.prev_last_seq.is_some()
+            }) {
                 bad[i] = true;
                 continue;
             }
             events.extend(p.items.iter().map(|it| Event {
                 group: it.group.clone(),
-                key: EventKey { source: it.source.clone(), seq: it.seq },
-                body: it.body.clone(),
+                key: EventKey::new(it.source.clone(), Pos::new(it.epoch, it.seq)),
+                body: if it.skip_to.is_some() { Bytes::new() } else { it.body.clone() },
+                skip_to: it.skip_to,
+                prev: it.prev_epoch.zip(it.prev_last_seq).map(|(epoch, last_seq)| EpochEnd { epoch, last_seq }),
             }));
         }
         let result = self.backend.publish(&events).await;
@@ -805,19 +855,29 @@ impl<B: Backend> Dispatcher<B> {
         let mut k = 0;
         for (i, p) in batch.into_iter().enumerate() {
             let reply = if bad[i] {
-                v1::PublishReply { request_id: p.request_id, status: vec![], error: "invalid group, source or seq".into() }
+                v1::PublishReply {
+                    request_id: p.request_id,
+                    status: vec![],
+                    error: "invalid group, source, epoch, seq, skip_to or previous epoch".into(),
+                    missing_below: vec![],
+                }
             } else {
                 match &result {
                     Ok(outcomes) => {
                         let mine = &outcomes[k..k + p.items.len()];
                         k += p.items.len();
+                        let missing_below = mine.iter().map(|o| o.missing_below).collect();
                         let status = mine
                             .iter()
                             .zip(&p.items)
-                            .map(|(o, it)| match o {
+                            .map(|(o, it)| match o.outcome {
                                 PublishOutcome::Stored | PublishOutcome::StoredHead => {
-                                    let head = *o == PublishOutcome::StoredHead;
-                                    let body = (it.body.len() <= HINT_BODY_MAX).then(|| it.body.clone());
+                                    let head = o.outcome == PublishOutcome::StoredHead;
+                                    let body = if it.skip_to.is_some() {
+                                        Some(Bytes::new())
+                                    } else {
+                                        (it.body.len() <= HINT_BODY_MAX).then(|| it.body.clone())
+                                    };
                                     stored.entry(it.group.clone()).or_default().push(v1::HintEvent {
                                         group: it.group.clone(),
                                         source: it.source.clone(),
@@ -825,6 +885,8 @@ impl<B: Backend> Dispatcher<B> {
                                         head,
                                         body,
                                         enqueued_us: now_us(),
+                                        epoch: it.epoch,
+                                        skip_to: it.skip_to,
                                     });
                                     self.stats.published.fetch_add(1, Relaxed);
                                     v1::PublishStatus::PublishStored as i32
@@ -836,14 +898,23 @@ impl<B: Backend> Dispatcher<B> {
                                 PublishOutcome::GroupMismatch => v1::PublishStatus::PublishGroupMismatch as i32,
                                 PublishOutcome::Conflict => {
                                     self.stats.publish_conflicts.fetch_add(1, Relaxed);
-                                    warn!(source = %it.source, seq = it.seq, "publish conflict: this (source, seq) is stored with a different body");
+                                    warn!(source = %it.source, epoch = it.epoch, seq = it.seq, "publish conflict: this position is stored with a different body");
                                     v1::PublishStatus::PublishConflict as i32
+                                }
+                                PublishOutcome::StaleEpoch => {
+                                    self.stats.publish_stale_epoch.fetch_add(1, Relaxed);
+                                    warn!(source = %it.source, epoch = it.epoch, seq = it.seq, "publish from a stale epoch rejected");
+                                    v1::PublishStatus::PublishStaleEpoch as i32
+                                }
+                                PublishOutcome::Late => {
+                                    self.stats.publish_late.fetch_add(1, Relaxed);
+                                    v1::PublishStatus::PublishLate as i32
                                 }
                             })
                             .collect();
-                        v1::PublishReply { request_id: p.request_id, status, error: String::new() }
+                        v1::PublishReply { request_id: p.request_id, status, error: String::new(), missing_below }
                     }
-                    Err(e) => v1::PublishReply { request_id: p.request_id, status: vec![], error: e.to_string() },
+                    Err(e) => v1::PublishReply { request_id: p.request_id, status: vec![], error: e.to_string(), missing_below: vec![] },
                 }
             };
             if !p.reply_to.is_empty() {
@@ -905,13 +976,13 @@ impl<B: Backend> Dispatcher<B> {
         let commits: Vec<Commit> = batch
             .iter()
             .flat_map(|b| b.items.iter().filter(|r| r.ok && !r.done))
-            .map(|r| Commit { key: EventKey { source: r.source.clone(), seq: r.seq }, effect: r.effect.clone() })
+            .map(|r| Commit { key: EventKey::new(r.source.clone(), Pos::new(r.epoch, r.seq)), effect: r.effect.clone() })
             .collect();
         // "done": the worker committed its own writes; remove the event if it is still pending (no hook)
         let removals: Vec<EventKey> = batch
             .iter()
             .flat_map(|b| b.items.iter().filter(|r| r.ok && r.done))
-            .map(|r| EventKey { source: r.source.clone(), seq: r.seq })
+            .map(|r| EventKey::new(r.source.clone(), Pos::new(r.epoch, r.seq)))
             .collect();
         let removed: Vec<Option<(CommitOutcome, Option<Head>)>> = if removals.is_empty() {
             vec![]
@@ -951,7 +1022,7 @@ impl<B: Backend> Dispatcher<B> {
                             match self.backend.commit(std::slice::from_ref(c)).await {
                                 Ok(o) => each.push(Some(o[0])),
                                 Err(e) => {
-                                    warn!(error = %e, source = %c.key.source, seq = c.key.seq, "commit failed");
+                                    warn!(error = %e, source = %c.key.source, pos = %c.key.pos, "commit failed");
                                     each.push(None);
                                 }
                             }
@@ -966,7 +1037,7 @@ impl<B: Backend> Dispatcher<B> {
         self.stats.commit_batches.fetch_add(1, Relaxed);
         let mut k = 0;
         // (group, source, seq, outcome known, for "done" removals: the source's next event) released from in-flight
-        let mut done: Vec<(String, String, i64, bool, Option<Option<Head>>, bool, String)> = vec![];
+        let mut done: Vec<(String, String, Pos, bool, Option<Option<Head>>, bool, String)> = vec![];
         let mut result_acks: HashMap<String, Vec<v1::ResultAck>> = HashMap::new();
         for b in batch {
             let mut acks = vec![];
@@ -1020,7 +1091,7 @@ impl<B: Backend> Dispatcher<B> {
                 } else {
                     self.stats.failures.fetch_add(1, Relaxed);
                     let delay = Duration::from_millis(r.retry_delay_ms.max(1) as u64);
-                    match self.backend.fail(&EventKey { source: r.source.clone(), seq: r.seq }, delay).await {
+                    match self.backend.fail(&EventKey::new(r.source.clone(), Pos::new(r.epoch, r.seq)), delay).await {
                         Ok(()) => v1::ResultStatus::ResultFailureRecorded,
                         Err(e) => {
                             warn!(error = %e, "recording a failure failed");
@@ -1031,7 +1102,7 @@ impl<B: Backend> Dispatcher<B> {
                 // Release it either way: on an error nothing changed in Octopus's tables, so offer it again now (flagged:
                 // a "done" worker has committed its own writes already).
                 let known = status != v1::ResultStatus::ResultError && status != v1::ResultStatus::ResultGap;
-                done.push((r.group.clone(), r.source.clone(), r.seq, known || !r.done, next, r.ok, r.worker_id.clone()));
+                done.push((r.group.clone(), r.source.clone(), Pos::new(r.epoch, r.seq), known || !r.done, next, r.ok, r.worker_id.clone()));
                 acks.push(v1::ResultAck { request_id: r.request_id, status: status as i32 });
             }
             if !b.reply_to.is_empty() {
@@ -1048,7 +1119,7 @@ impl<B: Backend> Dispatcher<B> {
             for (g, s, q, outcome_known, next, ok, w) in done {
                 let Core { groups, workers, .. } = &mut *core;
                 if let Some(st) = groups.get_mut(&g) {
-                    if st.inflight.get(&s).is_some_and(|f| f.seq == q && (ok || f.worker == w)) {
+                    if st.inflight.get(&s).is_some_and(|f| f.pos == q && (ok || f.worker == w)) {
                         if let Some(f) = st.inflight.remove(&s) {
                             unhold(workers, &f.worker);
                         }
@@ -1065,7 +1136,7 @@ impl<B: Backend> Dispatcher<B> {
                     match next {
                         // removed: the database told us the source's next event (or that none is due yet)
                         Some(n) if self.cfg.fast_path => {
-                            let c = st.cursor.entry(s.clone()).or_insert(0);
+                            let c = st.cursor.entry(s.clone()).or_default();
                             *c = (*c).max(q);
                             match n {
                                 Some(mut h) => {
@@ -1151,9 +1222,9 @@ impl<B: Backend> Dispatcher<B> {
                         // a read that started before a "done" (or before its cursor was flushed) can return events
                         // already done: skip them and look up the real next one by key
                         if let Some(&c) = st.cursor.get(&h.key.source) {
-                            if c >= h.key.seq {
+                            if c >= h.key.pos {
                                 if !st.inflight.contains_key(&h.key.source) {
-                                    st.want.insert(h.key.source.clone(), c + 1);
+                                    st.want.insert(h.key.source.clone(), c.next());
                                 }
                                 continue;
                             }
@@ -1202,15 +1273,29 @@ impl<B: Backend> Dispatcher<B> {
     /// Look up wanted next events by key and queue the ones found (missing ones stay wanted).
     async fn fetch_keys(&self, keys: Vec<(String, EventKey)>) {
         let groups: HashSet<String> = keys.iter().map(|(g, _)| g.clone()).collect();
-        let list: Vec<EventKey> = keys.into_iter().map(|(_, k)| k).collect();
+        let list: Vec<EventKey> = keys.iter().map(|(_, k)| k.clone()).collect();
         let result = self.backend.read_events(&list).await;
         let now = Instant::now();
         let sends = {
             let mut core = self.core.lock().unwrap();
             if let Ok(heads) = &result {
+                let found: HashSet<&EventKey> = heads.iter().map(|h| &h.key).collect();
+                // Not stored (yet): stop looking unless a later event of the source is known to be stored (then
+                // this one is waiting for a retry delay, or arriving). A next event published later reaches us
+                // with its publish (hint), and the fallback head read catches anything lost.
+                for (g, k) in &keys {
+                    if found.contains(k) {
+                        continue;
+                    }
+                    if let Some(st) = core.groups.get_mut(g) {
+                        if st.want.get(&k.source) == Some(&k.pos) && st.known_max.get(&k.source).is_none_or(|m| *m < k.pos) {
+                            st.want.remove(&k.source);
+                        }
+                    }
+                }
                 for h in heads {
                     if let Some(st) = core.groups.get_mut(&h.group) {
-                        if st.want.get(&h.key.source) == Some(&h.key.seq) {
+                        if st.want.get(&h.key.source) == Some(&h.key.pos) {
                             st.want.remove(&h.key.source);
                         }
                         st.offer(h.clone());
@@ -1230,9 +1315,39 @@ impl<B: Backend> Dispatcher<B> {
         self.send_assignments(sends).await;
     }
 
+    /// Give up the missing positions of a source stopped by a gap (its group's gap policy): the database records
+    /// the skip and moves the cursor if it still stands where the gap was seen; the worker hears of it with the
+    /// source's next delivery.
+    async fn skip_gap(&self, g: &octopus_core::Gap) {
+        // the database cursor must be current ("done" reports are written lazily)
+        self.flush_cursors().await;
+        let to = (g.first_stored.epoch == g.cursor.epoch).then(|| g.first_stored.seq - 1);
+        match self.backend.skip(&g.source, g.cursor, to, "gap timeout").await {
+            Ok(Some((new, skipped))) => {
+                warn!(group = %g.group, source = %g.source, epoch = skipped.epoch, from = skipped.from_seq, to = ?skipped.to_seq,
+                      cursor = %new, waiting_s = g.waiting.as_secs(), "gap skipped after the timeout");
+                let mut core = self.core.lock().unwrap();
+                core.skips += 1;
+                if let Some(st) = core.groups.get_mut(&g.group) {
+                    st.skipped.entry(g.source.clone()).or_default().push(skipped);
+                    let c = st.cursor.entry(g.source.clone()).or_default();
+                    *c = (*c).max(new);
+                    if !st.inflight.contains_key(&g.source) {
+                        st.want.insert(g.source.clone(), new.next());
+                    }
+                    st.dirty = true;
+                }
+                drop(core);
+                self.wake.notify_one();
+            }
+            Ok(None) => debug!(source = %g.source, "gap moved meanwhile: nothing skipped"),
+            Err(e) => warn!(error = %e, source = %g.source, "gap skip failed"),
+        }
+    }
+
     /// Write the cursors moved by "done" reports (one bulk statement). On failure they are kept for the next try.
     async fn flush_cursors(&self) {
-        let batch: Vec<(String, i64)> = {
+        let batch: Vec<(String, Pos)> = {
             let mut core = self.core.lock().unwrap();
             if core.unflushed.is_empty() {
                 return;
@@ -1243,7 +1358,7 @@ impl<B: Backend> Dispatcher<B> {
             warn!(error = %e, n = batch.len(), "cursor flush failed; will retry");
             let mut core = self.core.lock().unwrap();
             for (s, q) in batch {
-                let c = core.unflushed.entry(s).or_insert(0);
+                let c = core.unflushed.entry(s).or_default();
                 *c = (*c).max(q);
             }
         }
@@ -1297,13 +1412,13 @@ impl<B: Backend> Dispatcher<B> {
                         let age = now.duration_since(f.since);
                         if !f.warned && age >= LONG_OUTSTANDING {
                             f.warned = true;
-                            warn!(source = %s, seq = f.seq, worker = %f.worker, age_s = age.as_secs(), "delivery outstanding for long (the worker reports progress)");
+                            warn!(source = %s, pos = %f.pos, worker = %f.worker, age_s = age.as_secs(), "delivery outstanding for long (the worker reports progress)");
                         }
                     }
                     inflight.retain(|s, f| {
                         let keep = f.deadline > now;
                         if !keep {
-                            suspect.insert((s.clone(), f.seq)); // a result may have been lost: the worker may have committed
+                            suspect.insert((s.clone(), f.pos)); // a result may have been lost: the worker may have committed
                         }
                         keep
                     });
@@ -1457,7 +1572,7 @@ impl<B: Backend> Dispatcher<B> {
         let mut last_purge = Instant::now();
         let mut last_gap_check = Instant::now();
         // (source, cursor) of gaps already reported: each gap is reported once
-        let mut reported: HashSet<(String, i64)> = HashSet::new();
+        let mut reported: HashSet<(String, Pos)> = HashSet::new();
         loop {
             tokio::select! {
                 _ = tokio::time::sleep(self.cfg.stats_every.min(self.cfg.gap_check)) => {}
@@ -1466,17 +1581,34 @@ impl<B: Backend> Dispatcher<B> {
             if last_gap_check.elapsed() >= self.cfg.gap_check {
                 last_gap_check = Instant::now();
                 let owned: Vec<String> = self.core.lock().unwrap().groups.iter().filter(|(_, g)| g.serving).map(|(n, _)| n.clone()).collect();
-                match self.backend.gaps(&owned, self.cfg.gap_alert, 1000).await {
+                // every source stopped for a second or more: reported after gap_alert, skipped after its group's
+                // gap policy
+                match self.backend.gaps(&owned, self.cfg.gap_alert.min(Duration::from_secs(1)), 1000).await {
                     Ok(gaps) => {
-                        self.stats.gaps_open.store(gaps.len() as u64, Relaxed);
-                        let now_open: HashSet<(String, i64)> = gaps.iter().map(|g| (g.source.clone(), g.cursor)).collect();
+                        let open: HashSet<(String, Pos)> =
+                            gaps.iter().filter(|g| g.waiting >= self.cfg.gap_alert).map(|g| (g.source.clone(), g.cursor)).collect();
+                        self.stats.gaps_open.store(open.len() as u64, Relaxed);
                         for g in &gaps {
-                            if reported.insert((g.source.clone(), g.cursor)) {
-                                warn!(group = %g.group, source = %g.source, missing_from = g.cursor + 1, missing_to = g.first_stored - 1,
-                                      waiting_s = g.waiting.as_secs(), "gap: the source's next event is missing, later events wait");
+                            if g.waiting >= self.cfg.gap_alert && reported.insert((g.source.clone(), g.cursor)) {
+                                let missing_to = if g.first_stored.epoch == g.cursor.epoch {
+                                    (g.first_stored.seq - 1).to_string()
+                                } else {
+                                    "the end of the epoch (no declared end)".into()
+                                };
+                                warn!(group = %g.group, source = %g.source, epoch = g.cursor.epoch, missing_from = g.cursor.seq + 1,
+                                      %missing_to, next_stored = %g.first_stored, waiting_s = g.waiting.as_secs(),
+                                      "gap: the source's next event is missing, later events wait");
+                            }
+                            let policy = match g.gap_skip_ms {
+                                Some(ms) if ms < 0 => None,
+                                Some(ms) => Some(Duration::from_millis(ms as u64)),
+                                None => self.cfg.gap_skip,
+                            };
+                            if policy.is_some_and(|after| g.waiting >= after) {
+                                self.skip_gap(g).await;
                             }
                         }
-                        reported.retain(|k| now_open.contains(k));
+                        reported.retain(|k| open.contains(k));
                     }
                     Err(e) => warn!(error = %e, "gap check failed"),
                 }
@@ -1489,13 +1621,14 @@ impl<B: Backend> Dispatcher<B> {
                     Err(e) => warn!(error = %e, "purge failed"),
                 }
             }
-            let (groups, workers, inflight, ready) = {
+            let (groups, workers, inflight, ready, skips) = {
                 let core = self.core.lock().unwrap();
                 (
                     core.groups.values().filter(|g| g.serving).count(),
                     core.workers.len(),
                     core.groups.values().map(|g| g.inflight.len()).sum::<usize>(),
                     core.groups.values().map(|g| g.ready.len()).sum::<usize>(),
+                    core.skips,
                 )
             };
             let s = &self.stats;
@@ -1505,7 +1638,8 @@ impl<B: Backend> Dispatcher<B> {
                 completed_by_worker = s.completed_by_worker.load(Relaxed),
                 duplicates = s.duplicates.load(Relaxed), failures = s.failures.load(Relaxed),
                 timeouts = s.timeouts.load(Relaxed), stale_failures = s.stale_failures.load(Relaxed), gaps_open = s.gaps_open.load(Relaxed),
-                publish_conflicts = s.publish_conflicts.load(Relaxed), commit_batches = s.commit_batches.load(Relaxed),
+                publish_conflicts = s.publish_conflicts.load(Relaxed), publish_stale_epoch = s.publish_stale_epoch.load(Relaxed),
+                publish_late = s.publish_late.load(Relaxed), skips, commit_batches = s.commit_batches.load(Relaxed),
                 fetches = s.fetches.load(Relaxed), "stats"
             );
         }

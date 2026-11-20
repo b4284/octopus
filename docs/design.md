@@ -27,7 +27,7 @@ exactly once. The SQL database is the only durable state.
 
 - **Exactly-once execution of external side effects.** No system can promise it. The guarantee is
   exactly-once **effect on the database state**, and at-least-once **execution** of the worker.
-  - Workers that call outside systems must pass an idempotency key: `(source_id, seq)`.
+  - Workers that call outside systems must pass an idempotency key: `(source_id, epoch, seq)`.
 - **Zero downtime during a database failover.** That failover is zero loss, but publishes and commits pause
   until the new primary is up: seconds with automatic failover.
 
@@ -45,7 +45,7 @@ Octopus is a product with a database backend; only Octopus touches its own table
 **What this means for exactly-once.**
 - A worker can commit and then crash before its "done" arrives. Octopus cannot know about that commit, so it
   hands the event out again.
-- Exactly-once on the worker's data therefore rests on the worker's idempotency key `(source, seq)`: a per-source
+- Exactly-once on the worker's data therefore rests on the worker's idempotency key `(source, epoch, seq)`: a per-source
   "last applied seq", or a unique key, in its own tables.
 - Octopus flags every delivery it may have handed out before (`possibly_redelivered`): after a delivery timeout,
   after a "done" that hit a database error, and for events older than the group's current owner. Workers check
@@ -61,7 +61,7 @@ The apply/load hooks (state change committed by the dispatcher) remain an option
 | G1 | A publish is acknowledged only after its row is committed on the primary **and** on a synchronous replica in another DC. | The database's synchronous quorum replication; the dispatcher never acknowledges before commit |
 | G2 | Each event's state change is applied at most once and is never skipped: the source cursor moves from seq−1 to seq exactly once. | Cursor check, state change and queue delete in **one transaction** in the database |
 | G3 | Per-source order: event seq is applied only after seq−1. | The same cursor check, in the database |
-| G4 | A duplicate publish (producer retry) is stored at most once. | Unique key `(source_id, seq)`, and an insert guarded by the cursor |
+| G4 | A duplicate publish (producer retry) is stored at most once. | Unique key `(source_id, epoch, seq)`, and an insert guarded by the cursor |
 | G5 | Every committed event is eventually processed while one dispatcher and the database primary are up. | Leases expire and are reclaimed; heads are re-read from the database on every ownership change; fallback scans |
 | G6 | No cross-source blocking. | Hand-out only into free worker slots, with no read-ahead into busy workers |
 
@@ -140,13 +140,39 @@ Octopus owns only its own tables, in the `octopus` schema:
 
 | table | key | holds |
 |---|---|---|
-| `event` | `(source, seq)` | group, body, body hash, enqueued time, attempt count, `not_before` (retry delay) |
-| `source` | `source` | group (fixed by the first publish), `last_seq` (the cursor) |
-| `grp` | `name` | every group ever published to |
+| `event` | `(sid, epoch, seq)` | group, body, body hash, enqueued time, attempt count, `not_before` (retry delay), `skip_to` (a skip marker) |
+| `source` | `source` (text) | `id` (internal integer), group (fixed by the first publish), cursor `(epoch, last_seq)` |
+| `grp` | `name` | every group ever published to; `gap_skip_ms` (its gap policy) |
+| `epoch_end` | `(sid, epoch)` | where an epoch ended (declared by the source, or set when closed), and the next epoch |
+| `skipped` | `(sid, epoch, from_seq)` | positions given up: range, reason (declared by the source, gap timeout), time |
+| `late` | `(sid, epoch, seq)` | events that arrived after their position was skipped (never handed out) |
+| `meta` | `key` | the installed schema version (the migration runs only when it differs) |
 | `member` | `member_id` | address, heartbeat (database time) |
 | `lease` | `grp` | owner, epoch, `expires_at` (database time) |
 
-Source and group identifiers are text.
+Source and group identifiers are text on the wire; event rows carry the source's internal integer id.
+
+**Positions.** Every event's position is `(epoch, seq)`, stamped by its source: `seq` counts from 1 within an
+epoch, gapless; the source starts a new epoch whenever it cannot be sure of its counter (e.g. after losing state).
+Positions order by epoch, then seq. A source's cursor is the last position done; its **head** is
+`(cursor epoch, cursor seq + 1)`. The first events of a new epoch may declare where the previous epoch ended; once
+the cursor reaches that end, it moves to `(new epoch, 0)`. An event from an older epoch than the cursor's is a
+duplicate if within that epoch's declared end, otherwise rejected as `STALE_EPOCH` (fencing a stale producer).
+
+**Gaps.** A source whose head is missing while later events wait is stopped. Healing, cheapest first:
+1. reordering heals by itself (later events wait in the table);
+2. a lost publish heals by the producer's retries (producers retry until acknowledged);
+3. every publish reply reports how many positions directly below each event are missing; a producer that lost
+   them replays them, or publishes a **skip marker** (`skip_to`: "these positions are lost for good"); a marker is
+   never handed out: the cursor jumps over it, the range is recorded as skipped;
+4. the **gap policy** of the group (`grp.gap_skip_ms`, or the dispatchers' default `OCTOPUS_GAP_SKIP_MS`; unset or
+   negative = never, alert only): a source stopped longer is moved past the missing positions (within the epoch), or
+   its epoch is closed if it has no declared end and a later epoch has events. Only positions not stored at that
+   moment are given up, so an acknowledged event is never skipped.
+
+Every skip is recorded in `skipped`; the next delivery of the source lists it (`Delivery.skipped`), so the
+application can resynchronise or flag the record. An event arriving after its position was skipped is answered
+`LATE` and kept in `late`. Gaps waiting longer than `OCTOPUS_GAP_ALERT_MS` are reported (log, `gaps_open`).
 
 **Application state lives in the application's own tables,** written through two hooks: ordinary functions in the
 same database.
@@ -156,13 +182,13 @@ same database.
 - **Load hook** `fn(sources text[], seqs bigint[], bodies bytea[]) RETURNS TABLE(i int, context bytea)`. The
   dispatcher preloads each head's context with it and hands it to the worker.
 
-A source's **head** is the event with `seq = last_seq + 1`. Only heads are handed out, and a head exists only once
-its predecessor's commit has moved the cursor. So ordering comes from the database, not from insert order or ids.
+Only heads are handed out, and a head exists only once its predecessor is done. So ordering comes from the
+database, not from insert order or ids.
 
-**One race, handled.** A publish racing with the commit of the same `(source, seq)` can insert a row at or below
+**One race, handled.** A publish racing with the commit of the same `(source, epoch, seq)` can insert a row at or below
 the cursor: the insert waits for the commit's delete, then proceeds. Such a row is never a head. Every commit
 deletes all rows up to the new cursor (a range delete), and a periodic purge catches idle sources. Inserts happen
-in `(source, seq)` order, so concurrent publishes cannot deadlock.
+in `(source, epoch, seq)` order, so concurrent publishes cannot deadlock.
 
 ## 5. Protocol over a pub/sub fabric (owner, 2026-11-20)
 
@@ -203,7 +229,7 @@ All messages are idempotent, so any of them can be retried.
    arrived while the previous batch was being written. It then runs
    `INSERT … SELECT … WHERE seq > cursor ON CONFLICT DO NOTHING`.
 3. The instance replies `Stored`, `Duplicate` or `Conflict`, **only after** the commit has been replicated
-   synchronously. `Conflict`: this `(source, seq)` is stored with a different body (the dispatcher compares a
+   synchronously. `Conflict`: this `(source, epoch, seq)` is stored with a different body (the dispatcher compares a
    64-bit hash), so the source reused a number; nothing changes. A repeat of an event already applied cannot be
    compared (its row is gone) and is a `Duplicate`.
 4. Producers retry until acknowledged (by default without limit: giving up would leave a gap that holds back the
@@ -239,7 +265,7 @@ buffers without limit and never drops.
      counts only from the worker that holds the event now.
 3. **Deliver.** The dispatcher sends `Deliver(group, source, seq, body, preloaded state, attempt)` and records it
    in memory as handed out.
-   - Workers call external systems (§10), so **`(source_id, seq)` is the idempotency key** for those calls.
+   - Workers call external systems (§10), so **`(source_id, epoch, seq)` is the idempotency key** for those calls.
      A delivery can repeat after a crash; the key lets the external system recognise it.
 4. **Finish.** The worker answers with one of:
    - `Commit(state change)`: the dispatcher adds it to a batched transaction that checks the cursor, applies
@@ -274,8 +300,13 @@ buffers without limit and never drops.
 - **Delivery timeout.** If a handed-out event gets no commit, skip or fail within T, it is offered again. Workers
   running long events send progress messages to extend T. Without the timeout, one lost message on a
   non-persistent fabric strands its source.
-- **Guarded deletes.** "Already applied" deletes only rows with `seq <= cursor`. Publishes insert only rows with
-  `seq > cursor`, and the unique key absorbs retries.
+- **Guarded deletes.** "Already applied" deletes only rows at or below the cursor. Publishes insert only rows
+  beyond the cursor, and the unique key absorbs retries.
+- **Worker-commit mode** (`spec/WorkerCommit.tla`): with any dispatcher acting on any source with stale memory,
+  lazy cursor writes, skip markers, gap skips and epochs, each source's effects are applied in strictly increasing
+  position; every position below an applied one was applied, recorded as skipped, or declared lost by a stored
+  marker; and an acknowledged event is never skipped. Writing the model exposed that a skip must give up only positions not
+  stored at that moment (an event stored between the gap check and the skip was otherwise lost).
 
 ## 6. Failure walk-through
 
@@ -350,12 +381,11 @@ Postgres comes first. SQL Server (availability group with synchronous commit) an
 
 ## 10. Decisions (owner, 2026-11-20)
 
-1. **Ordering:** each source stamps a gapless per-source sequence number. Producers can publish concurrently and
-   retry; a gap holds back its source and raises an alert: every 10 s each dispatcher looks for owned sources whose
-   next event is missing while a later one has waited over 30 s (`OCTOPUS_GAP_ALERT_MS`), and reports each once
-   (`gaps_open` gauge). Healing gaps automatically is planned (benchmark backlog B23).
+1. **Ordering:** each source stamps a position `(epoch, seq)` (§4.2). Producers can publish concurrently and retry;
+   a gap holds back its source and is reported, then healed as in §4.2 ("Gaps"): replay or skip marker by the
+   producer, or the group's gap policy.
 2. **Sites:** two DCs plus a witness site (etcd only). §4.1 has the replica placement.
-3. **Side effects:** workers also call external systems. `(source_id, seq)` is passed with every delivery as the
+3. **Side effects:** workers also call external systems. `(source_id, epoch, seq)` is passed with every delivery as the
    idempotency key.
 4. **Event that always fails:** retry for ever with capped backoff and alert; an operator tool can skip it.
 

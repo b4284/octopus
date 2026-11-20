@@ -21,7 +21,7 @@ async fn main() {
         let (p, group, id) = (p.clone(), group.clone(), id.clone());
         tokio::spawn(async move {
             for q in 1.. {
-                let item = PublishItem { group: group.clone(), source: format!("{id}-big"), seq: q, body: Bytes::from(vec![b'x'; big]) };
+                let item = PublishItem { group: group.clone(), source: format!("{id}-big"), seq: q, body: Bytes::from(vec![b'x'; big]), ..Default::default() };
                 let t = Instant::now();
                 p.publish(vec![item]).await.unwrap();
                 eprintln!("large publish {} ms", t.elapsed().as_millis());
@@ -37,7 +37,7 @@ async fn main() {
             let mut lat = vec![];
             for q in 1..=(n / conc) as i64 {
                 let t = Instant::now();
-                let item = PublishItem { group: group.clone(), source: format!("{id}-{c}"), seq: q, body: Bytes::from_static(b"{}") };
+                let item = PublishItem { group: group.clone(), source: format!("{id}-{c}"), seq: q, body: Bytes::from_static(b"{}"), ..Default::default() };
                 p.publish(vec![item]).await.unwrap();
                 lat.push(t.elapsed().as_micros() as u64);
             }

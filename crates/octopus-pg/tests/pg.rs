@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use bytes::Bytes;
-use octopus_core::{Backend, Commit, CommitOutcome, Event, EventKey, HeadRequest, Member, PublishOutcome};
+use octopus_core::{Backend, Commit, CommitOutcome, EpochEnd, Event, EventKey, HeadRequest, Member, Pos, PublishOutcome, Published, Skipped};
 use octopus_pg::{PgBackend, PgConfig};
 
 fn conn_str() -> String {
@@ -65,12 +65,31 @@ async fn applied_rows(source: &str) -> Vec<(i64, Vec<u8>)> {
         .collect()
 }
 
+/// The epoch of single-epoch tests.
+const E: i64 = 1;
+
+fn p(seq: i64) -> Pos {
+    Pos::new(E, seq)
+}
+
+fn key(source: &str, seq: i64) -> EventKey {
+    EventKey::new(source, p(seq))
+}
+
 fn ev(group: &str, source: &str, seq: i64, body: &str) -> Event {
-    Event { group: group.into(), key: EventKey::new(source, seq), body: Bytes::from(body.to_owned()) }
+    ev_at(group, source, p(seq), body)
+}
+
+fn ev_at(group: &str, source: &str, pos: Pos, body: &str) -> Event {
+    Event { group: group.into(), key: EventKey::new(source, pos), body: Bytes::from(body.to_owned()), skip_to: None, prev: None }
+}
+
+async fn outcomes(b: &PgBackend, evs: &[Event]) -> Vec<PublishOutcome> {
+    b.publish(evs).await.unwrap().into_iter().map(|p| p.outcome).collect()
 }
 
 fn commit(source: &str, seq: i64, effect: &str) -> Commit {
-    Commit { key: EventKey::new(source, seq), effect: Bytes::from(effect.to_owned()) }
+    Commit { key: key(source, seq), effect: Bytes::from(effect.to_owned()) }
 }
 
 fn req(group: &str, max: usize) -> HeadRequest {
@@ -81,13 +100,13 @@ fn req(group: &str, max: usize) -> HeadRequest {
 async fn publish_is_idempotent_and_keeps_the_group() {
     let b = backend().await;
     let (g, g2, s) = (uniq("g"), uniq("g"), uniq("s"));
-    let r = b.publish(&[ev(&g, &s, 1, "a"), ev(&g, &s, 2, "b")]).await.unwrap();
+    let r = outcomes(&b, &[ev(&g, &s, 1, "a"), ev(&g, &s, 2, "b")]).await;
     assert_eq!(r, vec![PublishOutcome::StoredHead, PublishOutcome::Stored]);
     // a producer retry
-    let r = b.publish(&[ev(&g, &s, 2, "b"), ev(&g, &s, 3, "c")]).await.unwrap();
+    let r = outcomes(&b, &[ev(&g, &s, 2, "b"), ev(&g, &s, 3, "c")]).await;
     assert_eq!(r, vec![PublishOutcome::Duplicate, PublishOutcome::Stored]);
     // the source belongs to g
-    let r = b.publish(&[ev(&g2, &s, 4, "d")]).await.unwrap();
+    let r = outcomes(&b, &[ev(&g2, &s, 4, "d")]).await;
     assert_eq!(r, vec![PublishOutcome::GroupMismatch]);
     assert!(b.groups().await.unwrap().contains(&g));
 }
@@ -101,18 +120,18 @@ async fn heads_are_cursor_plus_one_oldest_first() {
     b.publish(&[ev(&g, &s1, 1, "x"), ev(&g, &s1, 2, "y"), ev(&g, &s2, 2, "z")]).await.unwrap();
     let heads = b.read_heads(&[req(&g, 10)]).await.unwrap();
     let keys: Vec<_> = heads.iter().map(|h| h.key.clone()).collect();
-    assert_eq!(keys, vec![EventKey::new(&s1, 1)]);
+    assert_eq!(keys, vec![key(&s1, 1)]);
     b.publish(&[ev(&g, &s2, 1, "w"), ev(&g, &s3, 1, "v")]).await.unwrap();
     let heads = b.read_heads(&[req(&g, 10)]).await.unwrap();
     let keys: Vec<_> = heads.iter().map(|h| h.key.clone()).collect();
-    assert_eq!(keys, vec![EventKey::new(&s1, 1), EventKey::new(&s2, 1), EventKey::new(&s3, 1)]);
+    assert_eq!(keys, vec![key(&s1, 1), key(&s2, 1), key(&s3, 1)]);
     // limit and exclusion
     let heads = b
         .read_heads(&[HeadRequest { group: g.clone(), max: 1, exclude_sources: vec![s1.clone()] }])
         .await
         .unwrap();
     assert_eq!(heads.len(), 1);
-    assert_eq!(heads[0].key, EventKey::new(&s2, 1));
+    assert_eq!(heads[0].key, key(&s2, 1));
     // context from the load hook
     let ctx = b.load_context(&heads).await.unwrap();
     assert_eq!(ctx[0].as_deref(), Some(format!("{s2}:1:w").as_bytes()));
@@ -135,7 +154,7 @@ async fn commit_applies_once_in_order() {
     assert_eq!(rows, vec![(1, b"e1".to_vec()), (2, b"e2".to_vec()), (3, b"e3".to_vec())]);
     assert!(b.read_heads(&[req(&g, 10)]).await.unwrap().is_empty());
     // publishing an applied event again is a duplicate and stores nothing
-    assert_eq!(b.publish(&[ev(&g, &s, 2, "b")]).await.unwrap(), vec![PublishOutcome::Duplicate]);
+    assert_eq!(outcomes(&b, &[ev(&g, &s, 2, "b")]).await, vec![PublishOutcome::Duplicate]);
     assert!(b.read_heads(&[req(&g, 10)]).await.unwrap().is_empty());
 }
 
@@ -156,17 +175,17 @@ async fn remove_returns_the_next_event() {
     let b = backend().await;
     let (g, s) = (uniq("g"), uniq("s"));
     b.publish(&[ev(&g, &s, 1, "a"), ev(&g, &s, 2, "b")]).await.unwrap();
-    let r = b.remove(&[EventKey::new(&s, 1)]).await.unwrap();
+    let r = b.remove(&[key(&s, 1)]).await.unwrap();
     assert_eq!(r[0].0, CommitOutcome::Applied);
     let next = r[0].1.as_ref().expect("seq 2 is next");
-    assert_eq!((next.key.seq, next.body.as_ref()), (2, &b"b"[..]));
+    assert_eq!((next.key.pos.seq, next.body.as_ref()), (2, &b"b"[..]));
     // again: already removed; the next event is still 2
-    let r = b.remove(&[EventKey::new(&s, 1)]).await.unwrap();
+    let r = b.remove(&[key(&s, 1)]).await.unwrap();
     assert_eq!(r[0].0, CommitOutcome::Duplicate);
-    let r = b.remove(&[EventKey::new(&s, 2)]).await.unwrap();
+    let r = b.remove(&[key(&s, 2)]).await.unwrap();
     assert_eq!(r[0], (CommitOutcome::Applied, None));
     // a publish of the now-next event reports it as the head
-    assert_eq!(b.publish(&[ev(&g, &s, 3, "c")]).await.unwrap(), vec![PublishOutcome::StoredHead]);
+    assert_eq!(outcomes(&b, &[ev(&g, &s, 3, "c")]).await, vec![PublishOutcome::StoredHead]);
 }
 
 #[tokio::test]
@@ -174,15 +193,15 @@ async fn advance_is_monotonic_and_read_events_finds_by_key() {
     let b = backend().await;
     let (g, s) = (uniq("g"), uniq("s"));
     b.publish(&[ev(&g, &s, 1, "a"), ev(&g, &s, 2, "b"), ev(&g, &s, 3, "c")]).await.unwrap();
-    let found = b.read_events(&[EventKey::new(&s, 2), EventKey::new(&s, 9)]).await.unwrap();
+    let found = b.read_events(&[key(&s, 2), key(&s, 9)]).await.unwrap();
     assert_eq!(found.len(), 1);
     assert_eq!((found[0].group.as_str(), found[0].body.as_ref()), (g.as_str(), &b"b"[..]));
     // done up to 2, delivered out of order and repeated: the cursor ends at 2, events 1 and 2 are gone
-    b.advance(&[(s.clone(), 2), (s.clone(), 1)]).await.unwrap();
-    b.advance(&[(s.clone(), 1)]).await.unwrap();
-    assert!(b.read_events(&[EventKey::new(&s, 1), EventKey::new(&s, 2)]).await.unwrap().is_empty());
+    b.advance(&[(s.clone(), p(2)), (s.clone(), p(1))]).await.unwrap();
+    b.advance(&[(s.clone(), p(1))]).await.unwrap();
+    assert!(b.read_events(&[key(&s, 1), key(&s, 2)]).await.unwrap().is_empty());
     let heads = b.read_heads(&[req(&g, 10)]).await.unwrap();
-    assert_eq!(heads.iter().map(|h| h.key.clone()).collect::<Vec<_>>(), vec![EventKey::new(&s, 3)]);
+    assert_eq!(heads.iter().map(|h| h.key.clone()).collect::<Vec<_>>(), vec![key(&s, 3)]);
 }
 
 #[tokio::test]
@@ -190,7 +209,7 @@ async fn failure_counts_attempts_and_delays_the_head() {
     let b = backend().await;
     let (g, s) = (uniq("g"), uniq("s"));
     b.publish(&[ev(&g, &s, 1, "a")]).await.unwrap();
-    b.fail(&EventKey::new(&s, 1), Duration::from_millis(400)).await.unwrap();
+    b.fail(&key(&s, 1), Duration::from_millis(400)).await.unwrap();
     assert!(b.read_heads(&[req(&g, 10)]).await.unwrap().is_empty());
     tokio::time::sleep(Duration::from_millis(500)).await;
     let heads = b.read_heads(&[req(&g, 10)]).await.unwrap();
@@ -258,7 +277,7 @@ async fn concurrent_chaos_applies_each_event_once_in_order() {
             let mut rnd = move || { x ^= x << 13; x ^= x >> 7; x ^= x << 17; x };
             for _ in 0..400 {
                 let heads = b.read_heads(&[req(&g, 8)]).await.unwrap();
-                let mut batch: Vec<Commit> = heads.iter().map(|h| commit(&h.key.source, h.key.seq, "eff")).collect();
+                let mut batch: Vec<Commit> = heads.iter().map(|h| commit(&h.key.source, h.key.pos.seq, "eff")).collect();
                 // add a stale duplicate and an early (gap) commit now and then
                 let s = &sources[(rnd() % sources.len() as u64) as usize];
                 batch.push(commit(s, 1 + (rnd() % N as u64) as i64, "noise"));
@@ -272,7 +291,7 @@ async fn concurrent_chaos_applies_each_event_once_in_order() {
     loop {
         let heads = b.read_heads(&[req(&g, 100)]).await.unwrap();
         if heads.is_empty() { break; }
-        let batch: Vec<Commit> = heads.iter().map(|h| commit(&h.key.source, h.key.seq, "eff")).collect();
+        let batch: Vec<Commit> = heads.iter().map(|h| commit(&h.key.source, h.key.pos.seq, "eff")).collect();
         b.commit(&batch).await.unwrap();
     }
     let mut per_source: HashMap<String, Vec<i64>> = HashMap::new();
@@ -288,15 +307,15 @@ async fn concurrent_chaos_applies_each_event_once_in_order() {
 async fn a_reused_seq_with_a_different_body_is_a_conflict() {
     let b = backend().await;
     let (g, s) = (uniq("g-conf"), uniq("s-conf"));
-    assert_eq!(b.publish(&[ev(&g, &s, 1, "a"), ev(&g, &s, 2, "b")]).await.unwrap(), vec![PublishOutcome::StoredHead, PublishOutcome::Stored]);
+    assert_eq!(outcomes(&b, &[ev(&g, &s, 1, "a"), ev(&g, &s, 2, "b")]).await, vec![PublishOutcome::StoredHead, PublishOutcome::Stored]);
     // the same body again: a retry; a different body under a stored number: a conflict, nothing changes
-    assert_eq!(b.publish(&[ev(&g, &s, 2, "b")]).await.unwrap(), vec![PublishOutcome::Duplicate]);
-    assert_eq!(b.publish(&[ev(&g, &s, 2, "B")]).await.unwrap(), vec![PublishOutcome::Conflict]);
-    let got = b.read_events(&[EventKey::new(&s, 2)]).await.unwrap();
+    assert_eq!(outcomes(&b, &[ev(&g, &s, 2, "b")]).await, vec![PublishOutcome::Duplicate]);
+    assert_eq!(outcomes(&b, &[ev(&g, &s, 2, "B")]).await, vec![PublishOutcome::Conflict]);
+    let got = b.read_events(&[key(&s, 2)]).await.unwrap();
     assert_eq!(got[0].body, Bytes::from("b"));
     // once applied, the row is gone: a repeat cannot be compared and is a duplicate
-    b.advance(&[(s.clone(), 2)]).await.unwrap();
-    assert_eq!(b.publish(&[ev(&g, &s, 2, "B")]).await.unwrap(), vec![PublishOutcome::Duplicate]);
+    b.advance(&[(s.clone(), p(2))]).await.unwrap();
+    assert_eq!(outcomes(&b, &[ev(&g, &s, 2, "B")]).await, vec![PublishOutcome::Duplicate]);
 }
 
 #[tokio::test]
@@ -308,13 +327,140 @@ async fn gaps_report_sources_whose_next_event_is_missing() {
     b.publish(&[ev(&g, &holed, 1, "x"), ev(&g, &holed, 4, "x"), ev(&g, &holed, 5, "x"), ev(&g, &whole, 1, "x"), ev(&g, &whole, 2, "x")])
         .await
         .unwrap();
-    b.advance(&[(holed.clone(), 1)]).await.unwrap();
+    b.advance(&[(holed.clone(), p(1))]).await.unwrap();
     // not old enough yet
     assert!(b.gaps(&[g.clone()], Duration::from_secs(60), 10).await.unwrap().is_empty());
     let gaps = b.gaps(&[g.clone()], Duration::ZERO, 10).await.unwrap();
     assert_eq!(gaps.len(), 1, "{gaps:?}");
-    assert_eq!((gaps[0].source.as_str(), gaps[0].cursor, gaps[0].first_stored), (holed.as_str(), 1, 4));
+    assert_eq!((gaps[0].source.as_str(), gaps[0].cursor, gaps[0].first_stored), (holed.as_str(), p(1), p(4)));
     // the missing events arrive: no gap any more
     b.publish(&[ev(&g, &holed, 2, "x"), ev(&g, &holed, 3, "x")]).await.unwrap();
     assert!(b.gaps(&[g.clone()], Duration::ZERO, 10).await.unwrap().is_empty());
+}
+
+async fn heads_of(b: &PgBackend, g: &str) -> Vec<EventKey> {
+    b.read_heads(&[HeadRequest { group: g.into(), max: 100, exclude_sources: vec![] }]).await.unwrap().into_iter().map(|h| h.key).collect()
+}
+
+/// (from_seq, to_seq, reason) of the source's recorded skips, and the seqs in the late table.
+async fn skips_and_late(source: &str) -> (Vec<(i64, i64, Option<i64>, String)>, Vec<(i64, i64)>) {
+    let (client, conn) = tokio_postgres::connect(&conn_str(), tokio_postgres::NoTls).await.unwrap();
+    tokio::spawn(conn);
+    let sk = client
+        .query("SELECT k.epoch, k.from_seq, k.to_seq, k.reason FROM octopus.skipped k JOIN octopus.source s ON s.id = k.sid \
+                 WHERE s.source = $1 ORDER BY 1, 2", &[&source])
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|r| (r.get(0), r.get(1), r.get(2), r.get(3)))
+        .collect();
+    let late = client
+        .query("SELECT l.epoch, l.seq FROM octopus.late l JOIN octopus.source s ON s.id = l.sid WHERE s.source = $1 ORDER BY 1, 2", &[&source])
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|r| (r.get(0), r.get(1)))
+        .collect();
+    (sk, late)
+}
+
+#[tokio::test]
+async fn publish_reports_how_many_positions_below_are_missing() {
+    let b = backend().await;
+    let (g, s) = (uniq("g-miss"), uniq("s-miss"));
+    let r = b.publish(&[ev(&g, &s, 1, "a"), ev(&g, &s, 3, "c")]).await.unwrap();
+    assert_eq!(r, vec![Published { outcome: PublishOutcome::StoredHead, missing_below: 0 }, Published { outcome: PublishOutcome::Stored, missing_below: 1 }]);
+    // batchmates count as present; an applied position counts as present
+    b.advance(&[(s.clone(), p(1))]).await.unwrap();
+    let r: Vec<i64> = b.publish(&[ev(&g, &s, 6, "f"), ev(&g, &s, 5, "e")]).await.unwrap().into_iter().map(|p| p.missing_below).collect();
+    assert_eq!(r, vec![0, 1], "6 follows 5 (same batch); 4 is missing below 5");
+    // the gap filled: a retry of 3 now reports nothing missing below it (2 is still missing)
+    let r = b.publish(&[ev(&g, &s, 2, "b"), ev(&g, &s, 4, "d")]).await.unwrap();
+    assert!(r.iter().all(|p| p.missing_below == 0), "{r:?}");
+}
+
+#[tokio::test]
+async fn a_new_epoch_follows_the_declared_end_of_the_previous_one() {
+    let b = backend().await;
+    let (g, s) = (uniq("g-ep"), uniq("s-ep"));
+    b.publish(&[ev(&g, &s, 1, "a"), ev(&g, &s, 2, "b")]).await.unwrap();
+    // the source restarts with epoch 7, saying epoch 1 ended at 2
+    let mut first = ev_at(&g, &s, Pos::new(7, 1), "x");
+    first.prev = Some(EpochEnd { epoch: E, last_seq: 2 });
+    assert_eq!(outcomes(&b, &[first, ev_at(&g, &s, Pos::new(7, 2), "y")]).await, vec![PublishOutcome::Stored, PublishOutcome::Stored]);
+    assert_eq!(heads_of(&b, &g).await, vec![key(&s, 1)], "epoch 1 goes first");
+    b.advance(&[(s.clone(), p(2))]).await.unwrap();
+    assert_eq!(heads_of(&b, &g).await, vec![EventKey::new(&s, Pos::new(7, 1))], "then epoch 7 from its start");
+    // fencing: an old-epoch position beyond its declared end is a stale producer; within it, a duplicate
+    assert_eq!(outcomes(&b, &[ev(&g, &s, 3, "z"), ev(&g, &s, 2, "b")]).await, vec![PublishOutcome::StaleEpoch, PublishOutcome::Duplicate]);
+
+    // a declaration arriving after the old epoch is already done moves the cursor at once
+    let s2 = uniq("s-ep2");
+    b.publish(&[ev(&g, &s2, 1, "a")]).await.unwrap();
+    b.advance(&[(s2.clone(), p(1))]).await.unwrap();
+    let mut first = ev_at(&g, &s2, Pos::new(9, 1), "x");
+    first.prev = Some(EpochEnd { epoch: E, last_seq: 1 });
+    assert_eq!(outcomes(&b, &[first]).await, vec![PublishOutcome::StoredHead]);
+}
+
+#[tokio::test]
+async fn skip_markers_are_jumped_over_and_late_arrivals_kept_apart() {
+    let b = backend().await;
+    let (g, s) = (uniq("g-mark"), uniq("s-mark"));
+    let mut marker = ev(&g, &s, 2, "");
+    marker.skip_to = Some(4);
+    b.publish(&[ev(&g, &s, 1, "a"), marker, ev(&g, &s, 5, "e")]).await.unwrap();
+    b.advance(&[(s.clone(), p(1))]).await.unwrap();
+    let heads = b.read_heads(&[HeadRequest { group: g.clone(), max: 10, exclude_sources: vec![] }]).await.unwrap();
+    assert_eq!((heads[0].key.clone(), heads[0].skip_to), (key(&s, 2), Some(4)), "the marker is the head (the dispatcher consumes it)");
+    // the dispatcher jumps the cursor to the marker's end: the skip is recorded, 5 is next
+    b.advance(&[(s.clone(), p(4))]).await.unwrap();
+    assert_eq!(heads_of(&b, &g).await, vec![key(&s, 5)]);
+    assert_eq!(outcomes(&b, &[ev(&g, &s, 3, "c")]).await, vec![PublishOutcome::Late]);
+    let (sk, late) = skips_and_late(&s).await;
+    assert_eq!(sk, vec![(E, 2, Some(4), "declared by the source".to_owned())]);
+    assert_eq!(late, vec![(E, 3)]);
+}
+
+#[tokio::test]
+async fn a_gap_can_be_skipped_within_an_epoch_or_by_closing_it() {
+    let b = backend().await;
+    let (g, s) = (uniq("g-skip"), uniq("s-skip"));
+    b.publish(&[ev(&g, &s, 1, "a"), ev(&g, &s, 4, "d")]).await.unwrap();
+    b.advance(&[(s.clone(), p(1))]).await.unwrap();
+    // a decision taken on an outdated cursor changes nothing
+    assert_eq!(b.skip(&s, p(0), Some(3), "test").await.unwrap(), None);
+    let r = b.skip(&s, p(1), Some(3), "test").await.unwrap();
+    assert_eq!(r, Some((p(3), Skipped { epoch: E, from_seq: 2, to_seq: Some(3) })));
+    assert_eq!(heads_of(&b, &g).await, vec![key(&s, 4)]);
+    assert_eq!(outcomes(&b, &[ev(&g, &s, 2, "b")]).await, vec![PublishOutcome::Late]);
+
+    // epoch 1 stops at 4 with no declared end while epoch 2 has events: close epoch 1
+    b.advance(&[(s.clone(), p(4))]).await.unwrap();
+    b.publish(&[ev_at(&g, &s, Pos::new(2, 1), "x")]).await.unwrap();
+    let gaps = b.gaps(&[g.clone()], Duration::ZERO, 10).await.unwrap();
+    assert_eq!((gaps[0].cursor, gaps[0].first_stored), (p(4), Pos::new(2, 1)));
+    let r = b.skip(&s, p(4), None, "test").await.unwrap();
+    assert_eq!(r, Some((Pos::new(2, 0), Skipped { epoch: E, from_seq: 5, to_seq: None })));
+    assert_eq!(heads_of(&b, &g).await, vec![EventKey::new(&s, Pos::new(2, 1))]);
+    assert_eq!(outcomes(&b, &[ev(&g, &s, 9, "late")]).await, vec![PublishOutcome::Late]);
+}
+
+#[tokio::test]
+async fn a_skip_never_gives_up_an_event_stored_meanwhile() {
+    let b = backend().await;
+    let (g, s) = (uniq("g-race"), uniq("s-race"));
+    b.publish(&[ev(&g, &s, 1, "a"), ev(&g, &s, 4, "d")]).await.unwrap();
+    b.advance(&[(s.clone(), p(1))]).await.unwrap();
+    // the gap 2..=3 was seen, but 2 arrives before the skip runs: only 3 may be given up... and 3 is not even
+    // the next position, so nothing is skipped now
+    assert_eq!(outcomes(&b, &[ev(&g, &s, 2, "b")]).await, vec![PublishOutcome::StoredHead]);
+    assert_eq!(b.skip(&s, p(1), Some(3), "test").await.unwrap(), None);
+    assert_eq!(heads_of(&b, &g).await, vec![key(&s, 2)]);
+    // and an epoch with stored positions beyond the cursor is not closed: the skip stops below them
+    b.advance(&[(s.clone(), p(2))]).await.unwrap();
+    b.publish(&[ev_at(&g, &s, Pos::new(2, 1), "x")]).await.unwrap();
+    let r = b.skip(&s, p(2), None, "test").await.unwrap();
+    assert_eq!(r, Some((p(3), Skipped { epoch: E, from_seq: 3, to_seq: Some(3) })));
+    assert_eq!(heads_of(&b, &g).await, vec![key(&s, 4)]);
 }

@@ -1,8 +1,8 @@
 //! Core types of Octopus and the interface every database backend implements.
 //!
 //! Correctness lives in the backend's transactions, not in dispatcher memory:
-//! - [`Backend::publish`] stores an event only if its seq is beyond the source's cursor; the unique key
-//!   `(source, seq)` absorbs retries.
+//! - [`Backend::publish`] stores an event only if its position `(epoch, seq)` is beyond the source's cursor; the
+//!   unique key `(source, epoch, seq)` absorbs retries.
 //! - [`Backend::commit`] applies an event only if the source's cursor is exactly `seq - 1`, and advances the
 //!   cursor, runs the application's apply hook and deletes the event, all in one transaction.
 //!
@@ -13,17 +13,51 @@ use std::time::Duration;
 
 use bytes::Bytes;
 
-/// Identifies one event: the source that produced it and the source's gapless sequence number (from 1).
-#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct EventKey {
-    pub source: String,
+/// A position in a source's sequence. The source stamps both: `epoch` names one run of its counter (a new epoch
+/// starts when the source cannot be sure of its counter, e.g. after losing state), `seq` counts from 1 within the
+/// epoch, gapless. Positions order by epoch, then seq.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct Pos {
+    pub epoch: i64,
     pub seq: i64,
 }
 
-impl EventKey {
-    pub fn new(source: impl Into<String>, seq: i64) -> Self {
-        Self { source: source.into(), seq }
+impl Pos {
+    pub const fn new(epoch: i64, seq: i64) -> Self {
+        Self { epoch, seq }
     }
+
+    /// The next position in the same epoch.
+    pub const fn next(self) -> Self {
+        Self { epoch: self.epoch, seq: self.seq + 1 }
+    }
+}
+
+impl std::fmt::Display for Pos {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}:{}", self.epoch, self.seq)
+    }
+}
+
+/// Identifies one event: its source and its position.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct EventKey {
+    pub source: String,
+    pub pos: Pos,
+}
+
+impl EventKey {
+    pub fn new(source: impl Into<String>, pos: Pos) -> Self {
+        Self { source: source.into(), pos }
+    }
+}
+
+/// Where a source's previous epoch ended, declared by the first events of a new epoch: once the cursor reaches
+/// `(epoch, last_seq)`, it moves on to the declaring event's epoch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EpochEnd {
+    pub epoch: i64,
+    pub last_seq: i64,
 }
 
 /// An event as published. `group` is the unit of ownership and of worker typing; a source belongs to exactly
@@ -33,6 +67,19 @@ pub struct Event {
     pub group: String,
     pub key: EventKey,
     pub body: Bytes,
+    /// A skip marker: the source declares that `key.pos.seq ..= skip_to` (same epoch) have no events (lost and not
+    /// recoverable). It is never handed to a worker; the cursor jumps over the range when it becomes the head.
+    pub skip_to: Option<i64>,
+    /// Declared end of the source's previous epoch (on the first events of a new epoch).
+    pub prev: Option<EpochEnd>,
+}
+
+/// The result of storing one event, plus how many positions directly below it (same epoch) are missing: neither
+/// stored nor applied. A hint for the producer (the missing ones may still be in flight).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Published {
+    pub outcome: PublishOutcome,
+    pub missing_below: i64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -47,6 +94,12 @@ pub enum PublishOutcome {
     GroupMismatch,
     /// This (source, seq) is stored with a different body: the source reused a number. Rejected, nothing changed.
     Conflict,
+    /// From an epoch older than the source's current one and beyond that epoch's declared end: a stale producer
+    /// instance (fencing). Rejected.
+    StaleEpoch,
+    /// Its position was skipped (declared lost, or given up after the gap timeout) before it arrived. Not handed
+    /// out; kept in the late table.
+    Late,
 }
 
 /// Ask for up to `max` heads of `group`, leaving out sources that already have an event in flight.
@@ -57,12 +110,14 @@ pub struct HeadRequest {
     pub exclude_sources: Vec<String>,
 }
 
-/// The next event of a source (seq = cursor + 1), ready to be handed out.
+/// The next event of a source (its position follows the cursor), ready to be handed out.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Head {
     pub group: String,
     pub key: EventKey,
     pub body: Bytes,
+    /// A skip marker (see [`Event::skip_to`]): never handed to a worker.
+    pub skip_to: Option<i64>,
     /// Failed attempts so far.
     pub attempts: i32,
     /// Database time the event was stored, microseconds since the Unix epoch.
@@ -74,6 +129,15 @@ pub struct Head {
 pub struct Commit {
     pub key: EventKey,
     pub effect: Bytes,
+}
+
+/// A range of positions given up: no event will be handed out for them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Skipped {
+    pub epoch: i64,
+    pub from_seq: i64,
+    /// None: the rest of the epoch (an epoch closed without a declared end).
+    pub to_seq: Option<i64>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -106,12 +170,15 @@ pub struct Lease {
 pub struct Gap {
     pub group: String,
     pub source: String,
-    /// The last applied seq (as written to the database).
-    pub cursor: i64,
-    /// The lowest stored seq above the cursor (so cursor + 1 ..= first_stored - 1 are missing).
-    pub first_stored: i64,
+    /// The last applied position (as written to the database).
+    pub cursor: Pos,
+    /// The lowest stored position above the cursor. Same epoch: `cursor.seq + 1 ..= first_stored.seq - 1` are
+    /// missing. A later epoch: the rest of the cursor's epoch is unknown (it has no declared end).
+    pub first_stored: Pos,
     /// How long the oldest stored event of the source has waited, database clock.
     pub waiting: Duration,
+    /// The group's gap policy (`grp.gap_skip_ms`): None = the dispatchers' default, negative = never skip.
+    pub gap_skip_ms: Option<i32>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -129,8 +196,9 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// A database backend. Every method is one transaction; results are returned only after the commit (and, with a
 /// synchronous standby, after the standby has it).
 pub trait Backend: Send + Sync + 'static {
-    /// Store events. Idempotent per `(source, seq)`; events at or below the cursor are not stored.
-    fn publish(&self, events: &[Event]) -> impl Future<Output = Result<Vec<PublishOutcome>>> + Send;
+    /// Store events. Idempotent per `(source, epoch, seq)`; events at or below the cursor are not stored. Records
+    /// declared epoch ends. One result per event, in order.
+    fn publish(&self, events: &[Event]) -> impl Future<Output = Result<Vec<Published>>> + Send;
 
     /// Read the heads of the requested groups (oldest first), skipping events waiting for a retry delay.
     fn read_heads(&self, requests: &[HeadRequest]) -> impl Future<Output = Result<Vec<Head>>> + Send;
@@ -148,7 +216,7 @@ pub trait Backend: Send + Sync + 'static {
 
     /// Persist cursors moved by "done" reports, in bulk: each cursor only moves forward; events at or below it are
     /// deleted. Monotonic and idempotent.
-    fn advance(&self, cursors: &[(String, i64)]) -> impl Future<Output = Result<()>> + Send;
+    fn advance(&self, cursors: &[(String, Pos)]) -> impl Future<Output = Result<()>> + Send;
 
     /// The stored events with these keys that are due (not waiting for a retry delay); missing ones are skipped.
     fn read_events(&self, keys: &[EventKey]) -> impl Future<Output = Result<Vec<Head>>> + Send;
@@ -179,6 +247,13 @@ pub trait Backend: Send + Sync + 'static {
 
     /// Every unexpired lease, with its owner's address.
     fn leases(&self) -> impl Future<Output = Result<Vec<(Lease, String)>>> + Send;
+
+    /// Give up positions of a source that is stopped by a missing event, if its cursor is still `after` (otherwise
+    /// nothing changes and None is returned: someone moved it meanwhile). `to_seq` Some: skip `after.seq + 1 ..=
+    /// to_seq` in the cursor's epoch. None: close the cursor's epoch where it stands and move on to the next stored
+    /// epoch. Records the skip; returns the new cursor and what was skipped.
+    fn skip(&self, source: &str, after: Pos, to_seq: Option<i64>, reason: &str)
+    -> impl Future<Output = Result<Option<(Pos, Skipped)>>> + Send;
 
     /// Sources of `groups` whose next event is missing while a later one has waited at least `older_than`
     /// (database clock), longest waiting first, at most `limit`.

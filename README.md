@@ -34,16 +34,22 @@ Octopus puts a small, stateless, leaderless dispatcher cluster in front of the d
 
 - **Zero loss.** A publish is acknowledged only after it is committed to the database and to a synchronous
   replica in another data center.
-- **Strict per-source order and exactly-once effect.** Each commit checks the source's cursor
-  (`seq = last + 1`), applies the state change and removes the queue row in **one transaction**. A
-  dispatcher's memory, a lease or a clock never decides correctness. A failed dispatcher can only cause a
-  duplicate *delivery*, which the database turns into "already applied".
+- **Strict per-source order.** Every event carries a position `(epoch, seq)` stamped by its source, and only a
+  source's next position is ever handed out, after the one before it is done. A dispatcher's memory, a lease or a
+  clock never decides correctness. A failed dispatcher can only cause a duplicate *delivery*, flagged as such.
+- **Exactly-once effect.** Either workers commit their own writes and check the idempotency key
+  `(source, epoch, seq)`, or Octopus applies the state change through an apply hook in the same transaction that
+  moves the cursor.
+- **Gaps heal, visibly.** A missing event holds back only its source. The publish reply tells the producer what
+  is missing below each event; it replays it or declares it lost (a skip marker); otherwise the group's gap policy
+  gives it up after a timeout. Every skip is recorded and told to the worker with the source's next event; a late
+  arrival is kept apart, never processed out of order.
 - **No cross-source blocking.** Work goes only into free worker slots. A failing event is retried for ever with
   backoff and an alert, and holds back only its own source.
 - **Active-active and elastic.** Any dispatcher accepts any publish or commit. Group ownership is spread by
   rendezvous hashing over database leases, with no leader. Scaling means adding pods; a lost pod's groups move
   within one lease TTL.
-- **At-least-once execution.** Workers get `(source_id, seq)` as an idempotency key for any external call.
+- **At-least-once execution.** Workers get `(source, epoch, seq)` as an idempotency key for any external call.
 
 ## Transport
 

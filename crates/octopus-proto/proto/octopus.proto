@@ -1,4 +1,4 @@
-// Octopus wire protocol, v1. Carried over a pub/sub fabric (MQTT 5 first; Solace speaks MQTT natively).
+// Octopus wire protocol, v1 (positions: every event carries epoch and seq). Carried over a pub/sub fabric (MQTT 5 first; Solace speaks MQTT natively).
 //
 // Topics ({ns} = namespace, default "octopus"; ids and group names must not contain '/', '+' or '#'):
 //   {ns}/pub/{group}       producer -> any dispatcher (shared subscription "$share/octopusd/{ns}/pub/+"): PublishRequest
@@ -31,11 +31,23 @@ message PublishRequest {
   repeated PublishItem items = 3;
 }
 
+// An event's position is (epoch, seq), stamped by its source: seq counts from 1 within an epoch, gapless; a source
+// starts a new epoch whenever it cannot be sure of its counter (e.g. after losing state). Positions order by epoch,
+// then seq. (source, epoch, seq) identifies the event.
 message PublishItem {
   string group = 1;
   string source = 2;
-  int64 seq = 3;                  // gapless per source, from 1, stamped by the source
+  int64 seq = 3;
   bytes body = 4;
+  int64 epoch = 5;
+  // A skip marker (body ignored): the source declares seq ..= skip_to of this epoch lost for good. Octopus hands
+  // none of them out, records the range as skipped, and tells the worker with the source's next delivery.
+  optional int64 skip_to = 6;
+  // On the first events of a new epoch: where the previous epoch ended. Once the cursor reaches
+  // (prev_epoch, prev_last_seq) it moves on to this epoch. Without it, a later epoch waits until the previous one
+  // is closed after the gap timeout.
+  optional int64 prev_epoch = 7;
+  optional int64 prev_last_seq = 8;
 }
 
 enum PublishStatus {
@@ -43,13 +55,19 @@ enum PublishStatus {
   PUBLISH_STORED = 1;
   PUBLISH_DUPLICATE = 2;          // already stored or already applied: a retry
   PUBLISH_GROUP_MISMATCH = 3;     // the source belongs to another group: rejected
-  PUBLISH_CONFLICT = 4;           // (source, seq) is stored with a different body: a reused number, rejected
+  PUBLISH_CONFLICT = 4;           // (source, epoch, seq) is stored with a different body: a reused number, rejected
+  PUBLISH_STALE_EPOCH = 5;        // an epoch older than the source's current one, beyond its declared end: rejected
+                                  // (a stale producer instance)
+  PUBLISH_LATE = 6;               // its position was skipped before it arrived: not handed out, kept for audit
 }
 
 message PublishReply {
   uint64 request_id = 1;
   repeated PublishStatus status = 2;   // one per item, in order; empty when error is set
   string error = 3;                    // the request was not stored; retry
+  // One per item: how many positions directly below it (same epoch) are neither stored nor applied. A hint for the
+  // producer: if it still has them in flight, nothing to do; if it lost them, replay them or publish a skip marker.
+  repeated int64 missing_below = 4;
 }
 
 // ---- discovery (retained) ----
@@ -83,10 +101,17 @@ message WorkerCredit {
                                   // of its events out with the worker, whatever the credit says
 }
 
+// Positions given up before this delivery: no event will be handed out for them.
+message Skipped {
+  int64 epoch = 1;
+  int64 from_seq = 2;
+  optional int64 to_seq = 3;      // absent: the rest of the epoch
+}
+
 message Delivery {
   string group = 1;
   string source = 2;
-  int64 seq = 3;                  // (source, seq) is the idempotency key for external side effects
+  int64 seq = 3;                  // (source, epoch, seq) is the idempotency key for external side effects
   bytes body = 4;
   optional bytes context = 5;     // from the load hook
   int32 attempts = 6;             // failed attempts so far
@@ -96,6 +121,10 @@ message Delivery {
   // owner): the worker may already have committed it. Workers check their idempotency key (source, seq) at least
   // for these. False means Octopus has never handed it out before.
   bool possibly_redelivered = 9;
+  int64 epoch = 10;
+  // Positions of this source skipped since its previous delivery (lost, declared by the source or given up after
+  // the gap timeout): the application may resynchronise or flag the record.
+  repeated Skipped skipped = 11;
 }
 
 message Deliver {
@@ -109,6 +138,7 @@ message WorkResult {
   string group = 2;
   string source = 3;
   int64 seq = 4;
+  int64 epoch = 10;
   bool ok = 5;
   bytes effect = 6;               // ok: passed to the apply hook in the commit transaction
   uint32 retry_delay_ms = 7;      // !ok: offer the event again after this delay
@@ -167,6 +197,8 @@ message HintEvent {
   bool head = 4;
   optional bytes body = 5;
   int64 enqueued_us = 6;
+  int64 epoch = 7;
+  optional int64 skip_to = 8;
 }
 
 // Worker -> dispatcher: still working on these events (extends the delivery timeout).
