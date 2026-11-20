@@ -570,20 +570,43 @@ impl<B: Backend> Dispatcher<B> {
             .flat_map(|b| b.items.iter().filter(|r| r.ok))
             .map(|r| Commit { key: EventKey { source: r.source.clone(), seq: r.seq }, effect: r.effect.clone() })
             .collect();
-        let outcomes = if commits.is_empty() { Ok(vec![]) } else { self.backend.commit(&commits).await };
+        // One outcome per commit; None = not committed (database error).
+        let outcomes: Vec<Option<CommitOutcome>> = if commits.is_empty() {
+            vec![]
+        } else {
+            match self.backend.commit(&commits).await {
+                Ok(o) => o.into_iter().map(Some).collect(),
+                Err(e) => {
+                    self.stats.commit_errors.fetch_add(1, Relaxed);
+                    warn!(error = %e, n = commits.len(), "commit batch failed");
+                    // One bad event (e.g. its apply hook raises) must not fail its neighbours: commit one by one.
+                    let mut each = Vec::with_capacity(commits.len());
+                    if commits.len() > 1 {
+                        for c in &commits {
+                            match self.backend.commit(std::slice::from_ref(c)).await {
+                                Ok(o) => each.push(Some(o[0])),
+                                Err(e) => {
+                                    warn!(error = %e, source = %c.key.source, seq = c.key.seq, "commit failed");
+                                    each.push(None);
+                                }
+                            }
+                        }
+                    } else {
+                        each.push(None);
+                    }
+                    each
+                }
+            }
+        };
         self.stats.commit_batches.fetch_add(1, Relaxed);
-        if let Err(e) = &outcomes {
-            self.stats.commit_errors.fetch_add(1, Relaxed);
-            warn!(error = %e, n = commits.len(), "commit batch failed");
-        }
         let mut k = 0;
         let mut done: Vec<(String, String, i64)> = vec![]; // (group, source, seq) released from in-flight
         for b in batch {
             let mut acks = vec![];
             for r in &b.items {
                 let status = if r.ok {
-                    let st = match &outcomes {
-                        Ok(o) => match o[k] {
+                    let st = match outcomes[k] {
+                        Some(o) => match o {
                             CommitOutcome::Applied => {
                                 self.stats.applied.fetch_add(1, Relaxed);
                                 v1::ResultStatus::ResultApplied
@@ -597,7 +620,7 @@ impl<B: Backend> Dispatcher<B> {
                                 v1::ResultStatus::ResultGap
                             }
                         },
-                        Err(_) => v1::ResultStatus::ResultError,
+                        None => v1::ResultStatus::ResultError,
                     };
                     k += 1;
                     st
@@ -612,9 +635,8 @@ impl<B: Backend> Dispatcher<B> {
                         }
                     }
                 };
-                if status != v1::ResultStatus::ResultError {
-                    done.push((r.group.clone(), r.source.clone(), r.seq));
-                }
+                // Release it either way: on an error nothing changed in the database, so offer it again now.
+                done.push((r.group.clone(), r.source.clone(), r.seq));
                 acks.push(v1::ResultAck { request_id: r.request_id, status: status as i32 });
             }
             if !b.reply_to.is_empty() {

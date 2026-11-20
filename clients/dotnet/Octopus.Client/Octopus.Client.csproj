@@ -1,0 +1,25 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <RootNamespace>Octopus.Client</RootNamespace>
+    <Description>Octopus client for .NET: producers and workers over MQTT 5.</Description>
+    <PackageLicenseExpression>GPL-3.0-only</PackageLicenseExpression>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Protobuf Include="../../../crates/octopus-proto/proto/octopus.proto" GrpcServices="None" Link="Protos/octopus.proto" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Google.Protobuf" Version="3.36.2" />
+    <PackageReference Include="Grpc.Tools" Version="2.85.0">
+      <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
+      <PrivateAssets>all</PrivateAssets>
+    </PackageReference>
+    <PackageReference Include="MQTTnet" Version="5.2.0.1603" />
+  </ItemGroup>
+
+</Project>

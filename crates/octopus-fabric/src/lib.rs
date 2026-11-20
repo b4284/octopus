@@ -40,7 +40,9 @@ pub struct MqttConfig {
     pub username: Option<String>,
     pub password: Option<String>,
     pub keep_alive: Duration,
-    /// QoS 1 by default: fewer losses on reconnects. QoS 0 ("direct") is also safe, only slower to recover.
+    /// QoS 0 ("direct") by default. Octopus never relies on the fabric's delivery guarantees (every acknowledgement
+    /// is an application reply after the database commit, and every message is retried), so QoS 1 only adds a broker
+    /// acknowledgement and an in-flight window per message.
     pub qos: u8,
     /// Retained message to publish on an unclean disconnect (e.g. clear a member announcement).
     pub last_will: Option<(String, Bytes, bool)>,
@@ -58,7 +60,7 @@ impl MqttConfig {
             username: None,
             password: None,
             keep_alive: Duration::from_secs(5),
-            qos: 1,
+            qos: 0,
             last_will: None,
             max_packet_size: 64 * 1024 * 1024,
             capacity: 65_536,

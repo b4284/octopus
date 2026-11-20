@@ -84,6 +84,21 @@ impl Drop for Dispatcher {
     }
 }
 
+/// Commits everything; the effect "boom" makes the apply hook raise for one chosen event, for a while.
+struct PoisonOnce {
+    poison: (String, i64),
+    hits: AtomicU64,
+}
+
+impl Handler for PoisonOnce {
+    async fn handle(&self, d: Delivery) -> Outcome {
+        if d.source == self.poison.0 && d.seq == self.poison.1 && self.hits.fetch_add(1, Ordering::Relaxed) < 3 {
+            return Outcome::Commit(Bytes::from_static(b"boom"));
+        }
+        Outcome::Commit(Bytes::from(format!("{}:{}", d.source, d.seq)))
+    }
+}
+
 /// Fails ~10% of attempts and is slow now and then.
 struct Flaky {
     calls: AtomicU64,
@@ -216,4 +231,24 @@ async fn three_dispatchers_survive_a_crash_and_a_planned_stop() {
     for w in workers {
         let _ = w.await;
     }
+}
+
+/// One event's apply hook raises (three times): its neighbours in the same commit batch must still commit, and
+/// the event itself must be applied once the hook stops failing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_failing_apply_hook_does_not_hold_back_other_sources() {
+    let ns = uniq("e2e");
+    let (groups, sources) = setup(&ns, 2, 30).await;
+    let _d = Dispatcher::start(&ns, "d1");
+    let (stop_tx, stop_rx) = watch::channel(false);
+    let id = format!("{ns}-w0");
+    let handler = PoisonOnce { poison: (sources[3].clone(), 5), hits: AtomicU64::new(0) };
+    let (w, rx) = Worker::connect(MqttConfig::new("127.0.0.1", 1883, id.clone()), WorkerConfig::new(id, ns.clone(), groups.clone(), 16), handler)
+        .await
+        .unwrap();
+    let worker = tokio::spawn(w.run(rx, stop_rx));
+    publish_all(&ns, &groups, &sources, 20).await;
+    wait_all_applied(&sources, 20, Duration::from_secs(60)).await;
+    let _ = stop_tx.send(true);
+    let _ = worker.await;
 }
