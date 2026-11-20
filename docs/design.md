@@ -113,17 +113,33 @@ A dispatcher cannot be more durable than the database it writes to.
 
 ### 4.2 Data model (the same on every SQL engine)
 
+Octopus owns only its own tables, in the `octopus` schema:
+
 | table | key | holds |
 |---|---|---|
-| `queue` | `(group_id, source_id, seq)` | event body, enqueued time, attempt count, `not_before` (retry delay) |
-| `source` | `source_id` | `group_id`, `last_seq` (the cursor), plus the application state rows |
+| `event` | `(source, seq)` | group, body, enqueued time, attempt count, `not_before` (retry delay) |
+| `source` | `source` | group (fixed by the first publish), `last_seq` (the cursor) |
+| `grp` | `name` | every group ever published to |
 | `member` | `member_id` | address, heartbeat (database time) |
-| `lease` | `group_id` | owner, epoch, expires_at (database time) |
-| `dead_letter` (optional, §6.5) | `(source_id, seq)` | event, last error |
+| `lease` | `grp` | owner, epoch, `expires_at` (database time) |
 
-A source's **head** is the row with `seq = last_seq + 1`. Only heads are handed out. A head becomes available
-only when its predecessor's commit has moved the cursor, so ordering comes from the database. It does not
-depend on insert order or on ids.
+Source and group identifiers are text.
+
+**Application state lives in the application's own tables,** written through two hooks: ordinary functions in the
+same database.
+- **Apply hook** `fn(sources text[], seqs bigint[], effects bytea[])`. The commit transaction calls it once per
+  batch, with the events that pass the cursor check. So the state change, the cursor advance and the event's
+  deletion commit together, or not at all.
+- **Load hook** `fn(sources text[], seqs bigint[], bodies bytea[]) RETURNS TABLE(i int, context bytea)`. The
+  dispatcher preloads each head's context with it and hands it to the worker.
+
+A source's **head** is the event with `seq = last_seq + 1`. Only heads are handed out, and a head exists only once
+its predecessor's commit has moved the cursor. So ordering comes from the database, not from insert order or ids.
+
+**One race, handled.** A publish racing with the commit of the same `(source, seq)` can insert a row at or below
+the cursor: the insert waits for the commit's delete, then proceeds. Such a row is never a head. Every commit
+deletes all rows up to the new cursor (a range delete), and a periodic purge catches idle sources. Inserts happen
+in `(source, seq)` order, so concurrent publishes cannot deadlock.
 
 ## 5. Protocol over a pub/sub fabric (owner, 2026-11-20)
 

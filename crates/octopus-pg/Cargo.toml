@@ -1,0 +1,20 @@
+[package]
+name = "octopus-pg"
+version = "0.1.0"
+description = "Octopus backend for PostgreSQL"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+octopus-core.workspace = true
+bytes.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-postgres.workspace = true
+deadpool-postgres.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
