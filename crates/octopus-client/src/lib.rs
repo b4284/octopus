@@ -34,6 +34,14 @@ fn envelope(body: Body) -> Bytes {
     Bytes::from(v1::Envelope { body: Some(body) }.encode_to_vec())
 }
 
+/// The envelopes inside an envelope (an EnvelopeBatch, possibly nested), or the envelope itself.
+fn flatten(env: v1::Envelope) -> Vec<v1::Envelope> {
+    match env.body {
+        Some(Body::Batch(b)) => b.items.into_iter().flat_map(flatten).collect(),
+        _ => vec![env],
+    }
+}
+
 // =========================================================================================================
 // Producer
 
@@ -67,9 +75,12 @@ impl Producer {
         let pending = p.pending.clone();
         tokio::spawn(async move {
             while let Some(m) = rx.recv().await {
-                if let Ok(v1::Envelope { body: Some(Body::PublishReply(r)) }) = v1::Envelope::decode(m.payload) {
-                    if let Some(tx) = pending.lock().unwrap().remove(&r.request_id) {
-                        let _ = tx.send(r);
+                let Ok(env) = v1::Envelope::decode(m.payload) else { continue };
+                for e in flatten(env) {
+                    if let Some(Body::PublishReply(r)) = e.body {
+                        if let Some(tx) = pending.lock().unwrap().remove(&r.request_id) {
+                            let _ = tx.send(r);
+                        }
                     }
                 }
             }
@@ -87,7 +98,8 @@ impl Producer {
             req.request_id = self.next_id.fetch_add(1, Relaxed);
             let (tx, rx) = oneshot::channel();
             self.pending.lock().unwrap().insert(req.request_id, tx);
-            if let Err(e) = self.fabric.publish(topic.clone(), Bytes::from(req.encode_to_vec())).await {
+            let batch = v1::PublishBatch { requests: vec![req.clone()] };
+            if let Err(e) = self.fabric.publish(topic.clone(), Bytes::from(batch.encode_to_vec())).await {
                 warn!(error = %e, "publish send failed");
             }
             match tokio::time::timeout(self.reply_timeout, rx).await {
@@ -270,9 +282,18 @@ impl<H: Handler> Worker<H> {
             }
             self.rebalance().await;
         } else if m.topic == self.inbox {
-            match v1::Envelope::decode(m.payload) {
-                Ok(v1::Envelope { body: Some(Body::Deliver(d)) }) => self.on_deliver(d),
-                Ok(v1::Envelope { body: Some(Body::ResultReply(r)) }) => {
+            let Ok(env) = v1::Envelope::decode(m.payload) else { return };
+            for e in flatten(env) {
+                self.clone().on_envelope(e);
+            }
+        }
+    }
+
+    fn on_envelope(self: Arc<Self>, e: v1::Envelope) {
+        {
+            match e {
+                v1::Envelope { body: Some(Body::Deliver(d)) } => self.on_deliver(d),
+                v1::Envelope { body: Some(Body::ResultReply(r)) } => {
                     for a in r.items {
                         match v1::ResultStatus::try_from(a.status) {
                             Ok(v1::ResultStatus::ResultApplied) => self.stats.applied.fetch_add(1, Relaxed),
@@ -317,9 +338,18 @@ impl<H: Handler> Worker<H> {
                         r.retry_delay_ms = delay.as_millis().min(u32::MAX as u128) as u32;
                     }
                 }
-                // the delivering dispatcher if it is alive, otherwise any dispatcher
-                let alive = me.state.lock().unwrap().members.contains_key(&member);
+                // the delivering dispatcher if it is alive, otherwise any dispatcher; the result also returns this
+                // slot's credit to it (counted as granted from now on)
+                let alive = {
+                    let mut st = me.state.lock().unwrap();
+                    let alive = st.members.contains_key(&member);
+                    if alive && st.owners.values().any(|m| *m == member) {
+                        *st.granted.entry(member.clone()).or_default() += 1;
+                    }
+                    alive
+                };
                 let topic = if alive { member_inbox } else { me.topics.any() };
+                r.worker_id = me.cfg.id.clone();
                 let batch = v1::ResultBatch { worker_id: me.cfg.id.clone(), reply_to: me.inbox.clone(), items: vec![r] };
                 if let Err(e) = me.fabric.publish(topic, envelope(Body::Results(batch))).await {
                     warn!(error = %e, "result send failed (the delivery timeout will re-offer the event)");

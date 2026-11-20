@@ -11,7 +11,7 @@ public sealed class OctopusOptions
 {
     public string Host { get; set; } = "127.0.0.1";
     public int Port { get; set; } = 1883;
-    /// <summary>Unique per connection (MQTT client id).</summary>
+    /// <summary>Unique per connection (MQTT client id; also names the connection's inbox).</summary>
     public string ClientId { get; set; } = $"octopus-{Guid.NewGuid():N}";
     public string Namespace { get; set; } = "octopus";
     public string? Username { get; set; }
@@ -19,6 +19,14 @@ public sealed class OctopusOptions
     /// <summary>0 ("direct", default) or 1. The fabric is never the durability point: replies come after the database
     /// commit and every message is retried, so QoS 1 only adds broker acknowledgements and an in-flight window.</summary>
     public int QoS { get; set; } = 0;
+    /// <summary>Upper bound for one coalesced message (bytes, approximate).</summary>
+    public int MaxBatchBytes { get; set; } = 4 << 20;
+    /// <summary>
+    /// A destination sent to less than this long ago waits out the rest of it, so everything queued meanwhile goes
+    /// as one message (like Kafka's linger.ms). An idle destination is sent to at once. Bounds the message rate per
+    /// destination to 1/Linger at an added latency of at most Linger.
+    /// </summary>
+    public TimeSpan Linger { get; set; } = TimeSpan.FromMilliseconds(2);
 }
 
 /// <summary>Topic layout (see octopus.proto).</summary>
@@ -33,33 +41,43 @@ public sealed class Topics(string ns)
 }
 
 /// <summary>
-/// One MQTT 5 connection shared by any number of producers and workers. Reconnects and resubscribes on its own,
-/// and tracks the live dispatchers and the owner of every group from their retained announcements.
+/// One MQTT 5 connection shared by any number of producers and workers, with one inbox for all of them.
+/// Reconnects and resubscribes on its own; tracks the live dispatchers and the owner of every group from their
+/// retained announcements; and coalesces outgoing messages per destination without timers (whatever queued while
+/// the previous send to that topic was in progress goes out as one message).
 /// </summary>
 public sealed class OctopusConnection : IAsyncDisposable
 {
     private readonly OctopusOptions _o;
     private readonly IMqttClient _client;
     private readonly MqttClientOptions _options;
-    private readonly ConcurrentDictionary<string, Action<ReadOnlySequence<byte>>> _inboxes = new();
     private readonly ConcurrentDictionary<string, byte> _filters = new();
+    private readonly ConcurrentDictionary<string, Outbox> _outboxes = new();
     private readonly CancellationTokenSource _cts = new();
     private readonly MqttQualityOfServiceLevel _qos;
     private int _reconnecting;
+    private long _nextRequest;
+
+    internal readonly ConcurrentDictionary<ulong, TaskCompletionSource<PublishReply>> PendingPublishes = new();
+    internal readonly ConcurrentDictionary<ulong, TaskCompletionSource<ResultStatus>> PendingResults = new();
+    internal readonly ConcurrentDictionary<string, OctopusWorker> Workers = new();
 
     public Topics Topics { get; }
+    /// <summary>This connection's inbox: replies and deliveries for every producer and worker on it.</summary>
+    public string Inbox { get; }
     /// <summary>member id -> inbox, for live dispatchers.</summary>
     public ConcurrentDictionary<string, string> Members { get; } = new();
     /// <summary>group -> owning member id.</summary>
     public ConcurrentDictionary<string, string> Owners { get; } = new();
     /// <summary>Raised (on the receive loop: keep it short) when members or owners change.</summary>
     public event Action? TopologyChanged;
-    public long Received, Sent;
+    public long Received, Sent, ItemsSent;
 
     private OctopusConnection(OctopusOptions o)
     {
         _o = o;
         Topics = new Topics(o.Namespace);
+        Inbox = Topics.Inbox(o.ClientId);
         _qos = o.QoS == 0 ? MqttQualityOfServiceLevel.AtMostOnce : MqttQualityOfServiceLevel.AtLeastOnce;
         _client = new MqttClientFactory().CreateMqttClient();
         var b = new MqttClientOptionsBuilder()
@@ -94,10 +112,13 @@ public sealed class OctopusConnection : IAsyncDisposable
     {
         var c = new OctopusConnection(o);
         await c._client.ConnectAsync(c._options, ct);
+        await c.SubscribeAsync(c.Inbox, ct);
         await c.SubscribeAsync(c.Topics.MembersFilter, ct);
         await c.SubscribeAsync(c.Topics.OwnersFilter, ct);
         return c;
     }
+
+    internal ulong NextRequestId() => (ulong)Interlocked.Increment(ref _nextRequest);
 
     private async Task ReconnectAsync()
     {
@@ -128,27 +149,89 @@ public sealed class OctopusConnection : IAsyncDisposable
         await _client.SubscribeAsync(new MqttClientSubscribeOptionsBuilder().WithTopicFilter(filter, _qos).Build(), ct);
     }
 
-    /// <summary>Route messages arriving on <paramref name="inbox"/> to <paramref name="handler"/> (called on the receive loop).</summary>
-    public Task RegisterInboxAsync(string inbox, Action<ReadOnlySequence<byte>> handler, CancellationToken ct = default)
-    {
-        _inboxes[inbox] = handler;
-        return SubscribeAsync(inbox, ct);
-    }
+    // ---- outgoing: coalesced per topic ----
 
-    public async Task PublishAsync(string topic, IMessage message, CancellationToken ct = default)
+    /// <summary>Queue an envelope for <paramref name="topic"/>; it goes out with whatever else is queued for it.</summary>
+    public void Send(string topic, Envelope envelope) => GetOutbox(topic, isPublish: false).Enqueue(envelope);
+
+    /// <summary>Queue a publish request; requests for the same topic travel as one PublishBatch.</summary>
+    internal void SendPublish(string topic, PublishRequest request) => GetOutbox(topic, isPublish: true).Enqueue(request);
+
+    private Outbox GetOutbox(string topic, bool isPublish) => _outboxes.GetOrAdd(topic, t => new Outbox(this, t, isPublish));
+
+    private async Task PublishRawAsync(string topic, byte[] payload)
     {
-        var msg = new MqttApplicationMessageBuilder().WithTopic(topic).WithPayload(message.ToByteArray()).WithQualityOfServiceLevel(_qos).Build();
+        var msg = new MqttApplicationMessageBuilder().WithTopic(topic).WithPayload(payload).WithQualityOfServiceLevel(_qos).Build();
         Interlocked.Increment(ref Sent);
-        await _client.PublishAsync(msg, ct);
+        await _client.PublishAsync(msg, _cts.Token);
     }
 
-    public Task SendAsync(string topic, Envelope envelope, CancellationToken ct = default) => PublishAsync(topic, envelope, ct);
+    /// <summary>One destination: a queue and at most one send in progress.</summary>
+    private sealed class Outbox(OctopusConnection conn, string topic, bool isPublish)
+    {
+        private readonly ConcurrentQueue<IMessage> _queue = new();
+        private int _sending;
+        private long _lastFlush;
+
+        public void Enqueue(IMessage m)
+        {
+            _queue.Enqueue(m);
+            if (Interlocked.CompareExchange(ref _sending, 1, 0) == 0) _ = Task.Run(DrainAsync);
+        }
+
+        private async Task DrainAsync()
+        {
+            while (true)
+            {
+                while (!_queue.IsEmpty)
+                {
+                    long wait = _lastFlush + (long)conn._o.Linger.TotalMilliseconds - Environment.TickCount64;
+                    if (wait > 0) await Task.Delay((int)wait);
+                    _lastFlush = Environment.TickCount64;
+                    var items = new List<IMessage>();
+                    int bytes = 0;
+                    while (bytes < conn._o.MaxBatchBytes && _queue.TryDequeue(out var m))
+                    {
+                        items.Add(m);
+                        bytes += m.CalculateSize();
+                    }
+                    byte[] payload;
+                    if (isPublish)
+                    {
+                        var b = new PublishBatch();
+                        foreach (var m in items) b.Requests.Add((PublishRequest)m);
+                        payload = b.ToByteArray();
+                    }
+                    else if (items.Count == 1)
+                    {
+                        payload = items[0].ToByteArray();
+                    }
+                    else
+                    {
+                        var b = new EnvelopeBatch();
+                        foreach (var m in items) b.Items.Add((Envelope)m);
+                        payload = new Envelope { Batch = b }.ToByteArray();
+                    }
+                    Interlocked.Add(ref conn.ItemsSent, items.Count);
+                    try { await conn.PublishRawAsync(topic, payload); }
+                    catch (Exception) { /* lost: every sender retries (publish replies, delivery timeouts, credit refresh) */ }
+                }
+                Volatile.Write(ref _sending, 0);
+                // something may have been queued after the last check
+                if (_queue.IsEmpty || Interlocked.CompareExchange(ref _sending, 1, 0) != 0) return;
+            }
+        }
+    }
+
+    // ---- incoming ----
 
     private void OnMessage(string topic, ReadOnlySequence<byte> payload)
     {
-        if (_inboxes.TryGetValue(topic, out var h))
+        if (topic == Inbox)
         {
-            h(payload);
+            Envelope env;
+            try { env = Envelope.Parser.ParseFrom(payload); } catch (InvalidProtocolBufferException) { return; }
+            Dispatch(env);
             return;
         }
         string prefix = Topics.Ns + "/";
@@ -171,6 +254,28 @@ public sealed class OctopusConnection : IAsyncDisposable
             if (info is { MemberId.Length: > 0 }) Owners[group] = info.MemberId;
             else Owners.TryRemove(group, out _);
             TopologyChanged?.Invoke();
+        }
+    }
+
+    private void Dispatch(Envelope env)
+    {
+        switch (env.BodyCase)
+        {
+            case Envelope.BodyOneofCase.Batch:
+                foreach (var e in env.Batch.Items) Dispatch(e);
+                break;
+            case Envelope.BodyOneofCase.PublishReply:
+                if (PendingPublishes.TryRemove(env.PublishReply.RequestId, out var p)) p.TrySetResult(env.PublishReply);
+                break;
+            case Envelope.BodyOneofCase.ResultReply:
+                foreach (var a in env.ResultReply.Items)
+                    if (PendingResults.TryRemove(a.RequestId, out var r)) r.TrySetResult(a.Status);
+                break;
+            case Envelope.BodyOneofCase.Deliver:
+                var d = env.Deliver;
+                foreach (var item in d.Items)
+                    if (Workers.TryGetValue(item.WorkerId, out var w)) w.OnDelivery(d.MemberId, d.Inbox, item);
+                break;
         }
     }
 

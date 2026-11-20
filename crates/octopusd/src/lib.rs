@@ -155,7 +155,8 @@ impl Core {
                 if st.inflight.contains_key(&r.head.key.source) {
                     continue; // already handed out meanwhile
                 }
-                let w = workers.get_mut(wid).unwrap();
+                let wid = wid.clone();
+                let w = workers.get_mut(&wid).unwrap();
                 w.credit -= 1;
                 st.inflight.insert(r.head.key.source.clone(), InFlight { seq: r.head.key.seq, deadline: now + timeout });
                 out.entry(w.inbox.clone()).or_default().push(v1::Delivery {
@@ -166,6 +167,7 @@ impl Core {
                     context: r.context,
                     attempts: r.head.attempts,
                     enqueued_us: r.head.enqueued_at_us,
+                    worker_id: wid.clone(),
                 });
             }
         }
@@ -275,9 +277,14 @@ impl<B: Backend> Dispatcher<B> {
         })
     }
 
-    /// The retained-message payload that clears this member's announcement (used as the MQTT last will).
+    /// The retained "gone" announcement (a MemberInfo with no inbox), used as the MQTT last will and on leave.
+    /// Not an empty payload: some brokers (NanoMQ) reject a zero-length will payload.
     pub fn last_will(topics: &Topics, member_id: &str) -> (String, Bytes, bool) {
-        (topics.member(member_id), Bytes::new(), true)
+        (topics.member(member_id), Self::gone(member_id), true)
+    }
+
+    fn gone(member_id: &str) -> Bytes {
+        Bytes::from(v1::MemberInfo { member_id: member_id.to_owned(), inbox: String::new(), started_us: 0 }.encode_to_vec())
     }
 
     /// Runs until `shutdown` turns true; then drains, gives the leases back and leaves.
@@ -333,7 +340,7 @@ impl<B: Backend> Dispatcher<B> {
         if let Err(e) = self.backend.leave(&self.cfg.member_id).await {
             warn!(error = %e, "leave failed (leases will expire)");
         }
-        let _ = self.fabric.publish_retained(t.member(&self.cfg.member_id), Bytes::new()).await;
+        let _ = self.fabric.publish_retained(t.member(&self.cfg.member_id), Self::gone(&self.cfg.member_id)).await;
         for task in tasks.drain(..) {
             let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
         }
@@ -347,11 +354,13 @@ impl<B: Backend> Dispatcher<B> {
         let ns = &self.cfg.ns;
         let Some(rest) = m.topic.strip_prefix(ns.as_str()).and_then(|r| r.strip_prefix('/')) else { return };
         if rest.starts_with("pub/") {
-            match v1::PublishRequest::decode(m.payload) {
-                Ok(r) => {
-                    let _ = pub_tx.try_send(PendingPublish { reply_to: r.reply_to, request_id: r.request_id, items: r.items });
+            match v1::PublishBatch::decode(m.payload) {
+                Ok(b) => {
+                    for r in b.requests {
+                        let _ = pub_tx.try_send(PendingPublish { reply_to: r.reply_to, request_id: r.request_id, items: r.items });
+                    }
                 }
-                Err(e) => debug!(error = %e, "bad publish request"),
+                Err(e) => debug!(error = %e, "bad publish batch"),
             }
         } else if let Some(group) = rest.strip_prefix("owner/") {
             let mut core = self.core.lock().unwrap();
@@ -365,11 +374,36 @@ impl<B: Backend> Dispatcher<B> {
             }
         } else if rest == "any" || m.topic == self.inbox {
             let Ok(env) = v1::Envelope::decode(m.payload) else { return };
+            self.on_envelope(env, res_tx);
+        }
+    }
+
+    fn on_envelope(&self, env: v1::Envelope, res_tx: &mpsc::Sender<PendingResults>) {
+        {
             match env.body {
+                Some(Body::Batch(b)) => {
+                    for e in b.items {
+                        self.on_envelope(e, res_tx);
+                    }
+                }
                 Some(Body::Credit(c)) => self.on_credit(c),
-                Some(Body::Results(r)) => {
-                    self.seen(&r.worker_id);
+                Some(Body::Results(mut r)) => {
+                    // each result frees its slot: one credit back to the worker it came from
+                    {
+                        let mut core = self.core.lock().unwrap();
+                        let now = Instant::now();
+                        for it in r.items.iter_mut() {
+                            if it.worker_id.is_empty() {
+                                it.worker_id = r.worker_id.clone();
+                            }
+                            if let Some(w) = core.workers.get_mut(&it.worker_id) {
+                                w.credit = w.credit.saturating_add(1);
+                                w.last_seen = now;
+                            }
+                        }
+                    }
                     let _ = res_tx.try_send(PendingResults { reply_to: r.reply_to, items: r.items });
+                    self.wake.notify_one();
                 }
                 Some(Body::Hint(h)) => {
                     let mut core = self.core.lock().unwrap();
@@ -480,6 +514,7 @@ impl<B: Backend> Dispatcher<B> {
         let result = self.backend.publish(&events).await;
         self.stats.publish_batches.fetch_add(1, Relaxed);
         let mut touched: HashSet<String> = HashSet::new();
+        let mut replies: HashMap<String, Vec<v1::Envelope>> = HashMap::new();
         let mut k = 0;
         for (i, p) in batch.into_iter().enumerate() {
             let reply = if bad[i] {
@@ -511,9 +546,10 @@ impl<B: Backend> Dispatcher<B> {
                 }
             };
             if !p.reply_to.is_empty() {
-                let _ = self.fabric.publish(p.reply_to, envelope(Body::PublishReply(reply))).await;
+                replies.entry(p.reply_to).or_default().push(v1::Envelope { body: Some(Body::PublishReply(reply)) });
             }
         }
+        self.send_batched(replies).await;
         if let Err(e) = &result {
             warn!(error = %e, "publish batch failed");
             return;
@@ -601,6 +637,7 @@ impl<B: Backend> Dispatcher<B> {
         self.stats.commit_batches.fetch_add(1, Relaxed);
         let mut k = 0;
         let mut done: Vec<(String, String, i64)> = vec![]; // (group, source, seq) released from in-flight
+        let mut result_acks: HashMap<String, Vec<v1::ResultAck>> = HashMap::new();
         for b in batch {
             let mut acks = vec![];
             for r in &b.items {
@@ -640,9 +677,14 @@ impl<B: Backend> Dispatcher<B> {
                 acks.push(v1::ResultAck { request_id: r.request_id, status: status as i32 });
             }
             if !b.reply_to.is_empty() {
-                let _ = self.fabric.publish(b.reply_to, envelope(Body::ResultReply(v1::ResultReply { items: acks }))).await;
+                result_acks.entry(b.reply_to).or_default().extend(acks);
             }
         }
+        let replies: HashMap<String, Vec<v1::Envelope>> = result_acks
+            .into_iter()
+            .map(|(to, items)| (to, vec![v1::Envelope { body: Some(Body::ResultReply(v1::ResultReply { items })) }]))
+            .collect();
+        self.send_batched(replies).await;
         {
             let mut core = self.core.lock().unwrap();
             for (g, s, q) in done {
@@ -729,6 +771,20 @@ impl<B: Backend> Dispatcher<B> {
         }
         self.send_deliveries(sends).await;
         self.wake.notify_one();
+    }
+
+    /// One message per destination: a single envelope as is, several as an EnvelopeBatch.
+    async fn send_batched(&self, by_topic: HashMap<String, Vec<v1::Envelope>>) {
+        for (topic, mut items) in by_topic {
+            let payload = if items.len() == 1 {
+                Bytes::from(items.pop().unwrap().encode_to_vec())
+            } else {
+                envelope(Body::Batch(v1::EnvelopeBatch { items }))
+            };
+            if let Err(e) = self.fabric.publish(topic, payload).await {
+                warn!(error = %e, "reply send failed (the sender retries)");
+            }
+        }
     }
 
     async fn send_deliveries(&self, sends: Vec<(String, Vec<v1::Delivery>)>) {

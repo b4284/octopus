@@ -19,87 +19,70 @@ public sealed class OctopusDelivery
 /// Receives work for some groups. The application takes deliveries from <see cref="Deliveries"/>, reports each one
 /// with <see cref="CompleteAsync"/> or <see cref="Fail"/>, and frees its slot with <see cref="Done"/>.
 /// Credits are granted to the owning dispatchers from free slots only, so no event waits inside a busy worker.
+/// A result returns its slot's credit to the dispatcher that receives it, so a busy worker sends no separate
+/// credit messages. Many workers can share one <see cref="OctopusConnection"/> (and its inbox).
 /// </summary>
 public sealed class OctopusWorker : IAsyncDisposable
 {
     private readonly OctopusConnection _conn;
     private readonly string _id;
-    private readonly string _inbox;
     private readonly string[] _groups;
     private readonly int _slots;
     private readonly Channel<OctopusDelivery> _deliveries = Channel.CreateUnbounded<OctopusDelivery>();
-    private readonly ConcurrentDictionary<ulong, TaskCompletionSource<ResultStatus>> _pending = new();
     private readonly ConcurrentDictionary<string, OctopusDelivery> _running = new();
     private readonly object _gate = new();
     private readonly Dictionary<string, int> _granted = new();   // member -> credits granted, not yet used
     private readonly CancellationTokenSource _cts = new();
     private readonly Task _refresh;
-    private long _nextReq;
     private int _rr;
 
     public ChannelReader<OctopusDelivery> Deliveries => _deliveries.Reader;
     public TimeSpan ResultTimeout { get; set; } = TimeSpan.FromSeconds(10);
     public TimeSpan ProgressAfter { get; set; } = TimeSpan.FromSeconds(5);
+    public string Id => _id;
     public long Received, ResultsSent;
 
     private OctopusWorker(OctopusConnection conn, string id, string[] groups, int slots)
     {
         _conn = conn;
         _id = id;
-        _inbox = conn.Topics.Inbox(id);
         _groups = groups;
         _slots = slots;
         _refresh = Task.Run(RefreshLoopAsync);
     }
 
-    /// <param name="id">Unique among workers (names its inbox).</param>
-    public static async Task<OctopusWorker> CreateAsync(OctopusConnection conn, string id, IEnumerable<string> groups, int slots, CancellationToken ct = default)
+    /// <param name="id">Unique among workers (deliveries are routed by it).</param>
+    public static OctopusWorker Create(OctopusConnection conn, string id, IEnumerable<string> groups, int slots)
     {
         var w = new OctopusWorker(conn, id, groups.ToArray(), slots);
-        await conn.RegisterInboxAsync(w._inbox, w.OnInbox, ct);
+        if (!conn.Workers.TryAdd(id, w)) throw new ArgumentException($"worker id {id} already used on this connection");
         conn.TopologyChanged += w.OnTopologyChanged;
         w.OnTopologyChanged();
         return w;
     }
 
-    private void OnInbox(System.Buffers.ReadOnlySequence<byte> payload)
+    internal void OnDelivery(string member, string memberInbox, Delivery item)
     {
-        Envelope env;
-        try { env = Envelope.Parser.ParseFrom(payload); } catch (InvalidProtocolBufferException) { return; }
-        if (env.Deliver is { } d)
-        {
-            lock (_gate)
-            {
-                _granted[d.MemberId] = Math.Max(0, _granted.GetValueOrDefault(d.MemberId) - d.Items.Count);
-            }
-            foreach (var item in d.Items)
-            {
-                var od = new OctopusDelivery { Item = item, Member = d.MemberId, MemberInbox = d.Inbox };
-                _running[item.Source] = od;
-                Interlocked.Increment(ref Received);
-                _deliveries.Writer.TryWrite(od);
-            }
-        }
-        else if (env.ResultReply is { } r)
-        {
-            foreach (var a in r.Items)
-                if (_pending.TryRemove(a.RequestId, out var tcs)) tcs.TrySetResult(a.Status);
-        }
+        lock (_gate) _granted[member] = Math.Max(0, _granted.GetValueOrDefault(member) - 1);
+        var od = new OctopusDelivery { Item = item, Member = member, MemberInbox = memberInbox };
+        _running[item.Source] = od;
+        Interlocked.Increment(ref Received);
+        _deliveries.Writer.TryWrite(od);
     }
 
     /// <summary>Commit the event with this effect (passed to the apply hook). Returns what the database decided.</summary>
     public async Task<ResultStatus> CompleteAsync(OctopusDelivery d, ByteString effect, CancellationToken ct = default)
     {
-        var r = new WorkResult { RequestId = (ulong)Interlocked.Increment(ref _nextReq), Group = d.Item.Group, Source = d.Item.Source, Seq = d.Item.Seq, Ok = true, Effect = effect };
+        var r = new WorkResult { RequestId = _conn.NextRequestId(), Group = d.Item.Group, Source = d.Item.Source, Seq = d.Item.Seq, Ok = true, Effect = effect, WorkerId = _id };
         var tcs = new TaskCompletionSource<ResultStatus>(TaskCreationOptions.RunContinuationsAsynchronously);
-        _pending[r.RequestId] = tcs;
+        _conn.PendingResults[r.RequestId] = tcs;
         try
         {
-            await SendResultAsync(d, r, ct);
+            SendResult(d, r);
             return await tcs.Task.WaitAsync(ResultTimeout, ct);
         }
         catch (TimeoutException) { return ResultStatus.ResultError; }
-        finally { _pending.TryRemove(r.RequestId, out _); }
+        finally { _conn.PendingResults.TryRemove(r.RequestId, out _); }
     }
 
     /// <summary>The event failed: offer it again after <paramref name="retryDelay"/>.</summary>
@@ -107,20 +90,27 @@ public sealed class OctopusWorker : IAsyncDisposable
     {
         var r = new WorkResult
         {
-            RequestId = (ulong)Interlocked.Increment(ref _nextReq), Group = d.Item.Group, Source = d.Item.Source, Seq = d.Item.Seq,
-            Ok = false, RetryDelayMs = (uint)Math.Clamp(retryDelay.TotalMilliseconds, 1, uint.MaxValue),
+            RequestId = _conn.NextRequestId(), Group = d.Item.Group, Source = d.Item.Source, Seq = d.Item.Seq,
+            Ok = false, RetryDelayMs = (uint)Math.Clamp(retryDelay.TotalMilliseconds, 1, uint.MaxValue), WorkerId = _id,
         };
-        return SendResultAsync(d, r, ct);
+        SendResult(d, r);
+        return Task.CompletedTask;
     }
 
-    private async Task SendResultAsync(OctopusDelivery d, WorkResult r, CancellationToken ct)
+    private void SendResult(OctopusDelivery d, WorkResult r)
     {
-        var batch = new ResultBatch { WorkerId = _id, ReplyTo = _inbox };
+        var batch = new ResultBatch { WorkerId = _id, ReplyTo = _conn.Inbox };
         batch.Items.Add(r);
         // the delivering dispatcher if it is alive, otherwise any dispatcher
-        string topic = _conn.Members.ContainsKey(d.Member) ? d.MemberInbox : _conn.Topics.Any;
+        bool alive = _conn.Members.ContainsKey(d.Member);
+        if (alive)
+        {
+            // the dispatcher counts the result as one credit back: account for it as granted
+            lock (_gate)
+                if (OwnerMembers().Contains(d.Member)) _granted[d.Member] = _granted.GetValueOrDefault(d.Member) + 1;
+        }
         Interlocked.Increment(ref ResultsSent);
-        await _conn.SendAsync(topic, new Envelope { Results = batch }, ct);
+        _conn.Send(alive ? d.MemberInbox : _conn.Topics.Any, new Envelope { Results = batch });
     }
 
     /// <summary>The application is done with the delivery: its slot is free again.</summary>
@@ -128,7 +118,7 @@ public sealed class OctopusWorker : IAsyncDisposable
     {
         if (Interlocked.Exchange(ref d.Done, 1) == 1) return;
         _running.TryRemove(new KeyValuePair<string, OctopusDelivery>(d.Item.Source, d));
-        _ = RebalanceAsync();
+        Rebalance();
     }
 
     private void OnTopologyChanged()
@@ -140,7 +130,7 @@ public sealed class OctopusWorker : IAsyncDisposable
             foreach (var m in _granted.Keys.ToList())
                 if (!owners.Contains(m)) _granted.Remove(m);
         }
-        _ = RebalanceAsync();
+        Rebalance();
     }
 
     private HashSet<string> OwnerMembers()
@@ -152,7 +142,7 @@ public sealed class OctopusWorker : IAsyncDisposable
     }
 
     /// <summary>Hand free slots out as credits, round robin over the live owners of our groups.</summary>
-    private async Task RebalanceAsync()
+    private void Rebalance()
     {
         var grants = new Dictionary<string, int>();
         lock (_gate)
@@ -167,41 +157,39 @@ public sealed class OctopusWorker : IAsyncDisposable
                 grants[m] = grants.GetValueOrDefault(m) + 1;
             }
         }
-        foreach (var (m, n) in grants) await SendCreditAsync(m, n, reset: false);
+        foreach (var (m, n) in grants) SendCredit(m, n, reset: false);
     }
 
-    private async Task SendCreditAsync(string member, int credit, bool reset)
+    private void SendCredit(string member, int credit, bool reset)
     {
         if (!_conn.Members.TryGetValue(member, out var inbox)) return;
-        var c = new WorkerCredit { WorkerId = _id, Inbox = _inbox, Credit = (uint)credit, Reset = reset };
+        var c = new WorkerCredit { WorkerId = _id, Inbox = _conn.Inbox, Credit = (uint)credit, Reset = reset };
         c.Groups.AddRange(_groups);
-        try { await _conn.SendAsync(inbox, new Envelope { Credit = c }); } catch (Exception) { /* resent by the refresh */ }
+        _conn.Send(inbox, new Envelope { Credit = c });
     }
 
     /// <summary>Every second: resend each owner the exact outstanding credit (resync), report long-running events.</summary>
     private async Task RefreshLoopAsync()
     {
+        // spread the refreshes of many workers over the second
+        try { await Task.Delay(Random.Shared.Next(1000), _cts.Token); } catch (OperationCanceledException) { return; }
         using var timer = new PeriodicTimer(TimeSpan.FromSeconds(1));
         try
         {
             while (await timer.WaitForNextTickAsync(_cts.Token))
             {
                 Dictionary<string, int> resync;
-                lock (_gate)
-                {
-                    resync = OwnerMembers().ToDictionary(m => m, m => _granted.GetValueOrDefault(m));
-                }
-                foreach (var (m, n) in resync) await SendCreditAsync(m, n, reset: true);
-                var progress = _running.Values
-                    .Where(d => Environment.TickCount64 - d.ReceivedAt >= ProgressAfter.TotalMilliseconds && _conn.Members.ContainsKey(d.Member))
-                    .GroupBy(d => d.MemberInbox);
-                foreach (var g in progress)
+                lock (_gate) resync = OwnerMembers().ToDictionary(m => m, m => _granted.GetValueOrDefault(m));
+                foreach (var (m, n) in resync) SendCredit(m, n, reset: true);
+                foreach (var g in _running.Values
+                             .Where(d => Environment.TickCount64 - d.ReceivedAt >= ProgressAfter.TotalMilliseconds && _conn.Members.ContainsKey(d.Member))
+                             .GroupBy(d => d.MemberInbox))
                 {
                     var p = new Progress { WorkerId = _id };
                     p.Sources.AddRange(g.Select(d => d.Item.Source));
-                    try { await _conn.SendAsync(g.Key, new Envelope { Progress = p }); } catch (Exception) { }
+                    _conn.Send(g.Key, new Envelope { Progress = p });
                 }
-                await RebalanceAsync();
+                Rebalance();
             }
         }
         catch (OperationCanceledException) { }
@@ -210,9 +198,10 @@ public sealed class OctopusWorker : IAsyncDisposable
     public async ValueTask DisposeAsync()
     {
         _conn.TopologyChanged -= OnTopologyChanged;
+        _conn.Workers.TryRemove(_id, out _);
         _cts.Cancel();
         try { await _refresh; } catch { }
-        foreach (var m in OwnerMembers()) await SendCreditAsync(m, 0, reset: true);
+        foreach (var m in OwnerMembers()) SendCredit(m, 0, reset: true);
         _deliveries.Writer.TryComplete();
     }
 }
