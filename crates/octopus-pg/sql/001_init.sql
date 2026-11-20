@@ -36,6 +36,9 @@ CREATE TABLE IF NOT EXISTS octopus.event (
         autovacuum_vacuum_cost_delay = 0);
 -- Bodies are stored as they are: compressing multi-megabyte events on every insert costs more CPU than it saves.
 ALTER TABLE octopus.event ALTER COLUMN body SET STORAGE EXTERNAL;
+-- A hash of the body (computed by the dispatcher): a repeat of a stored (source, seq) with a different body is a
+-- conflict (the source reused a number), not a harmless retry.
+ALTER TABLE octopus.event ADD COLUMN IF NOT EXISTS body_hash bigint;
 
 -- Dispatcher membership (heartbeats on the database clock).
 CREATE TABLE IF NOT EXISTS octopus.member (
@@ -54,12 +57,15 @@ CREATE TABLE IF NOT EXISTS octopus.lease (
 
 -- Publish: register groups and sources, then insert each event only if its seq is beyond the cursor
 -- (an event at or below the cursor is already applied). Returns per event: 0 stored, 1 duplicate,
--- 2 the source belongs to another group, 3 stored and it is the source's head (seq = cursor + 1) right now.
+-- 2 the source belongs to another group, 3 stored and it is the source's head (seq = cursor + 1) right now,
+-- 4 conflict: (source, seq) is stored with a different body (a reused number; nothing changed).
+-- A repeat of an event already applied cannot be compared (its row is gone): it is a duplicate.
 --
 -- A publish racing with the commit of the same (source, seq) can still insert a row at or below the cursor
 -- (the insert waits for the commit's delete and then proceeds). Such a row is never a head; the next commit
 -- of the source deletes it (range delete), and octopus.purge_applied() catches idle sources.
-CREATE OR REPLACE FUNCTION octopus.publish(p_grp text[], p_source text[], p_seq bigint[], p_body bytea[])
+DROP FUNCTION IF EXISTS octopus.publish(text[], text[], bigint[], bytea[]);
+CREATE OR REPLACE FUNCTION octopus.publish(p_grp text[], p_source text[], p_seq bigint[], p_body bytea[], p_hash bigint[])
 RETURNS smallint[] LANGUAGE plpgsql AS $$
 DECLARE
     r smallint[];
@@ -74,23 +80,26 @@ BEGIN
          WHERE NOT EXISTS (SELECT 1 FROM octopus.source x WHERE x.source = u.s) ORDER BY s
         ON CONFLICT DO NOTHING;
     WITH u AS (
-        SELECT * FROM unnest(p_grp, p_source, p_seq, p_body) WITH ORDINALITY AS u(g, s, q, b, i)
+        SELECT * FROM unnest(p_grp, p_source, p_seq, p_body, p_hash) WITH ORDINALITY AS u(g, s, q, b, h, i)
     ), ins AS (
-        INSERT INTO octopus.event (source, seq, grp, body)
-        SELECT u.s, u.q, u.g, u.b
+        INSERT INTO octopus.event (source, seq, grp, body, body_hash)
+        SELECT u.s, u.q, u.g, u.b, u.h
           FROM u JOIN octopus.source src ON src.source = u.s
          WHERE src.grp = u.g AND u.q > src.last_seq
          ORDER BY u.s, u.q              -- one insertion order for everyone: no deadlocks between publishes
         ON CONFLICT DO NOTHING
         RETURNING source, seq
     )
+    -- (the outer query sees the rows as they were before this statement: ex is a row stored earlier)
     SELECT array_agg(CASE WHEN src.grp <> u.g THEN 2
                           WHEN ins.source IS NOT NULL AND u.q = src.last_seq + 1 THEN 3
                           WHEN ins.source IS NOT NULL THEN 0
+                          WHEN ex.body_hash IS NOT NULL AND ex.body_hash <> u.h THEN 4
                           ELSE 1 END ORDER BY u.i)
       INTO r
       FROM u JOIN octopus.source src ON src.source = u.s
-      LEFT JOIN ins ON ins.source = u.s AND ins.seq = u.q;
+      LEFT JOIN ins ON ins.source = u.s AND ins.seq = u.q
+      LEFT JOIN octopus.event ex ON ex.source = u.s AND ex.seq = u.q;
     RETURN r;
 END $$;
 

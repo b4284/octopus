@@ -45,6 +45,8 @@ pub enum PublishOutcome {
     Duplicate,
     /// The source already belongs to another group: rejected.
     GroupMismatch,
+    /// This (source, seq) is stored with a different body: the source reused a number. Rejected, nothing changed.
+    Conflict,
 }
 
 /// Ask for up to `max` heads of `group`, leaving out sources that already have an event in flight.
@@ -97,6 +99,19 @@ pub struct Lease {
     pub group: String,
     pub owner: String,
     pub epoch: i64,
+}
+
+/// A source whose next event (cursor + 1) is missing while a later one is stored: it cannot move on.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Gap {
+    pub group: String,
+    pub source: String,
+    /// The last applied seq (as written to the database).
+    pub cursor: i64,
+    /// The lowest stored seq above the cursor (so cursor + 1 ..= first_stored - 1 are missing).
+    pub first_stored: i64,
+    /// How long the oldest stored event of the source has waited, database clock.
+    pub waiting: Duration,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -164,6 +179,10 @@ pub trait Backend: Send + Sync + 'static {
 
     /// Every unexpired lease, with its owner's address.
     fn leases(&self) -> impl Future<Output = Result<Vec<(Lease, String)>>> + Send;
+
+    /// Sources of `groups` whose next event is missing while a later one has waited at least `older_than`
+    /// (database clock), longest waiting first, at most `limit`.
+    fn gaps(&self, groups: &[String], older_than: Duration, limit: i32) -> impl Future<Output = Result<Vec<Gap>>> + Send;
 
     /// Housekeeping: delete up to `limit` rows left at or below their cursor by a publish/commit race.
     fn purge_applied(&self, limit: i32) -> impl Future<Output = Result<i64>> + Send;

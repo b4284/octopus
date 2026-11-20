@@ -53,7 +53,12 @@ pub struct Producer {
     next_id: AtomicU64,
     /// Wait this long for a reply before sending again.
     pub reply_timeout: Duration,
+    /// 0 (the default): retry until acknowledged. Giving up leaves a gap in the source's sequence, which holds
+    /// back every later event of the source, so only tests should set a limit.
     pub max_attempts: u32,
+    /// A publish not acknowledged after this long is reported (a warning and [`Producer::stuck`]).
+    pub alert_after: Duration,
+    stuck: AtomicU64,
 }
 
 impl Producer {
@@ -70,7 +75,9 @@ impl Producer {
             pending: Arc::default(),
             next_id: AtomicU64::new(1),
             reply_timeout: Duration::from_secs(5),
-            max_attempts: 20,
+            max_attempts: 0,
+            alert_after: Duration::from_secs(30),
+            stuck: AtomicU64::new(0),
         });
         let pending = p.pending.clone();
         tokio::spawn(async move {
@@ -94,7 +101,28 @@ impl Producer {
         let topic = self.topics.publish(&first.group);
         let mut req = v1::PublishRequest { reply_to: self.inbox.clone(), request_id: 0, items };
         let mut backoff = Duration::from_millis(50);
-        for attempt in 1..=self.max_attempts {
+        let started = Instant::now();
+        let mut alerted = false;
+        let mut attempt: u32 = 0;
+        // leaves the stuck count right however this call ends
+        struct Unstick<'a>(&'a AtomicU64, bool);
+        impl Drop for Unstick<'_> {
+            fn drop(&mut self) {
+                if self.1 {
+                    self.0.fetch_sub(1, Relaxed);
+                }
+            }
+        }
+        let mut unstick = Unstick(&self.stuck, false);
+        while self.max_attempts == 0 || attempt < self.max_attempts {
+            attempt += 1;
+            if !alerted && started.elapsed() >= self.alert_after {
+                alerted = true;
+                unstick.1 = true;
+                self.stuck.fetch_add(1, Relaxed);
+                let keys: Vec<String> = req.items.iter().take(5).map(|i| format!("{}#{}", i.source, i.seq)).collect();
+                warn!(events = req.items.len(), first = ?keys, waited_s = started.elapsed().as_secs(), "publish not acknowledged yet; still retrying");
+            }
             req.request_id = self.next_id.fetch_add(1, Relaxed);
             let (tx, rx) = oneshot::channel();
             self.pending.lock().unwrap().insert(req.request_id, tx);
@@ -117,6 +145,11 @@ impl Producer {
             backoff = (backoff * 2).min(Duration::from_secs(2));
         }
         Err(Error::Timeout(self.max_attempts))
+    }
+
+    /// Publishes currently retrying for longer than `alert_after` (a gauge for alerting).
+    pub fn stuck(&self) -> u64 {
+        self.stuck.load(Relaxed)
     }
 }
 
@@ -171,6 +204,7 @@ pub struct WorkerStats {
 }
 
 struct Running {
+    source: String,
     member: String,
     member_inbox: String,
     started: Instant,
@@ -184,13 +218,29 @@ struct WState {
     members: HashMap<String, String>,
     /// member -> credits granted and not yet used
     granted: HashMap<String, u32>,
-    /// source -> the event being processed
-    running: HashMap<String, Running>,
+    /// delivery id -> the event being processed (by delivery: two deliveries of one source are two entries)
+    running: HashMap<u64, Running>,
+    next_delivery: u64,
     rr: usize,
 }
 
 impl WState {
     /// Owners of our groups that are alive, with their inboxes (sorted for a stable round robin).
+    /// The invariant: events held plus credits granted never exceed the slots. Takes back any excess (largest
+    /// grants first); returns (inbox, new credit) for each owner told a lower amount.
+    fn clamp(&mut self, slots: u32) -> Vec<(String, u32)> {
+        let mut excess = (self.running.len() as u32 + self.granted.values().sum::<u32>()).saturating_sub(slots);
+        let mut changed: HashMap<String, u32> = HashMap::new();
+        while excess > 0 {
+            let Some((m, n)) = self.granted.iter_mut().filter(|(_, n)| **n > 0).max_by_key(|(_, n)| **n) else { break };
+            let take = (*n).min(excess);
+            *n -= take;
+            excess -= take;
+            changed.insert(m.clone(), *n);
+        }
+        changed.into_iter().filter_map(|(m, n)| self.members.get(&m).map(|i| (i.clone(), n))).collect()
+    }
+
     fn owner_inboxes(&self) -> Vec<(String, String)> {
         let mut v: Vec<(String, String)> = self
             .owners
@@ -317,18 +367,24 @@ impl<H: Handler> Worker<H> {
     }
 
     fn on_deliver(self: Arc<Self>, d: v1::Deliver) {
-        {
+        let ids: Vec<u64> = {
             let mut st = self.state.lock().unwrap();
             let g = st.granted.entry(d.member_id.clone()).or_default();
             *g = g.saturating_sub(d.items.len() as u32);
-            for it in &d.items {
-                st.running.insert(
-                    it.source.clone(),
-                    Running { member: d.member_id.clone(), member_inbox: d.inbox.clone(), started: Instant::now() },
-                );
-            }
-        }
-        for item in d.items {
+            d.items
+                .iter()
+                .map(|it| {
+                    st.next_delivery += 1;
+                    let id = st.next_delivery;
+                    st.running.insert(
+                        id,
+                        Running { source: it.source.clone(), member: d.member_id.clone(), member_inbox: d.inbox.clone(), started: Instant::now() },
+                    );
+                    id
+                })
+                .collect()
+        };
+        for (item, id) in d.items.into_iter().zip(ids) {
             self.stats.received.fetch_add(1, Relaxed);
             let me = self.clone();
             let (member, member_inbox) = (d.member_id.clone(), d.inbox.clone());
@@ -338,7 +394,7 @@ impl<H: Handler> Worker<H> {
                 let mut r = v1::WorkResult { request_id: me.next_req.fetch_add(1, Relaxed), group, source: source.clone(), seq, ..Default::default() };
                 match outcome {
                     Outcome::Vanish => {
-                        me.state.lock().unwrap().running.remove(&source);
+                        me.state.lock().unwrap().running.remove(&id);
                         return;
                     }
                     Outcome::Done => {
@@ -358,13 +414,16 @@ impl<H: Handler> Worker<H> {
                 }
                 // the delivering dispatcher if it is alive, otherwise any dispatcher; the result also returns this
                 // slot's credit to it (counted as granted from now on)
-                let alive = {
+                let (alive, corrections) = {
                     let mut st = me.state.lock().unwrap();
                     let alive = st.members.contains_key(&member);
                     if alive && st.owners.values().any(|m| *m == member) {
                         *st.granted.entry(member.clone()).or_default() += 1;
                     }
-                    alive
+                    // the handler is finished: its slot is free (and its credit is on its way back)
+                    st.running.remove(&id);
+                    // the implicit return assumes the delivery came out of a credit: correct any excess now
+                    (alive, st.clamp(me.cfg.slots))
                 };
                 let topic = if alive { member_inbox } else { me.topics.any() };
                 r.worker_id = me.cfg.id.clone();
@@ -372,7 +431,10 @@ impl<H: Handler> Worker<H> {
                 if let Err(e) = me.fabric.publish(topic, envelope(Body::Results(batch))).await {
                     warn!(error = %e, "result send failed (the delivery timeout will re-offer the event)");
                 }
-                me.state.lock().unwrap().running.remove(&source);
+                for (inbox, n) in corrections {
+                    me.send_credit(&inbox, n, true).await;
+                }
+                me.state.lock().unwrap().running.remove(&id);
                 me.rebalance().await;
             });
         }
@@ -450,13 +512,14 @@ impl<H: Handler> Worker<H> {
     /// Periodic: resend each owner the exact outstanding credit (resync after losses), report long-running events.
     async fn refresh(&self) {
         let (resync, progress) = {
-            let st = self.state.lock().unwrap();
+            let mut st = self.state.lock().unwrap();
+            st.clamp(self.cfg.slots);
             let resync: Vec<(String, u32)> =
                 st.owner_inboxes().into_iter().map(|(m, inbox)| (inbox, st.granted.get(&m).copied().unwrap_or(0))).collect();
             let mut progress: HashMap<String, Vec<String>> = HashMap::new();
-            for (s, r) in &st.running {
+            for r in st.running.values() {
                 if r.started.elapsed() >= self.cfg.progress_after && st.members.contains_key(&r.member) {
-                    progress.entry(r.member_inbox.clone()).or_default().push(s.clone());
+                    progress.entry(r.member_inbox.clone()).or_default().push(r.source.clone());
                 }
             }
             (resync, progress)
@@ -472,7 +535,14 @@ impl<H: Handler> Worker<H> {
     }
 
     async fn send_credit(&self, inbox: &str, credit: u32, reset: bool) {
-        let c = v1::WorkerCredit { worker_id: self.cfg.id.clone(), inbox: self.inbox.clone(), groups: self.cfg.groups.clone(), credit, reset };
+        let c = v1::WorkerCredit {
+            worker_id: self.cfg.id.clone(),
+            inbox: self.inbox.clone(),
+            groups: self.cfg.groups.clone(),
+            credit,
+            reset,
+            slots: self.cfg.slots,
+        };
         if let Err(e) = self.fabric.publish(inbox.to_owned(), envelope(Body::Credit(c))).await {
             warn!(error = %e, "credit send failed");
         }

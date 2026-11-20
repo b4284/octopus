@@ -10,8 +10,19 @@ namespace Octopus.Client;
 public sealed class OctopusProducer(OctopusConnection conn)
 {
     public TimeSpan ReplyTimeout { get; set; } = TimeSpan.FromSeconds(5);
-    public int MaxAttempts { get; set; } = 20;
+    /// <summary>
+    /// 0 (the default): retry until acknowledged. Giving up leaves a gap in the source's sequence, which holds back
+    /// every later event of the source, so only tests should set a limit.
+    /// </summary>
+    public int MaxAttempts { get; set; } = 0;
+    /// <summary>A publish not acknowledged after this long is reported through <see cref="Stuck"/>.</summary>
+    public TimeSpan AlertAfter { get; set; } = TimeSpan.FromSeconds(30);
+    /// <summary>Raised once per publish that is still not acknowledged after <see cref="AlertAfter"/> (it keeps retrying).</summary>
+    public event Action<IReadOnlyList<PublishItem>, TimeSpan>? Stuck;
     public long Retries;
+    /// <summary>Publishes currently retrying for longer than <see cref="AlertAfter"/> (a gauge for alerting).</summary>
+    public long StuckNow => Interlocked.Read(ref _stuck);
+    private long _stuck;
 
     /// <summary>Publishes and returns one status per item, in order, once committed.</summary>
     public async Task<IReadOnlyList<PublishStatus>> PublishAsync(IReadOnlyList<PublishItem> items, CancellationToken ct = default)
@@ -23,8 +34,19 @@ public sealed class OctopusProducer(OctopusConnection conn)
         // request; the group level of the topic is informational)
         string topic = conn.Topics.Publish("_");
         var backoff = TimeSpan.FromMilliseconds(50);
-        for (int attempt = 1; attempt <= MaxAttempts; attempt++)
+        long started = Environment.TickCount64;
+        bool alerted = false;
+        try
         {
+        for (int attempt = 1; MaxAttempts == 0 || attempt <= MaxAttempts; attempt++)
+        {
+            var waited = TimeSpan.FromMilliseconds(Environment.TickCount64 - started);
+            if (!alerted && waited >= AlertAfter)
+            {
+                alerted = true;
+                Interlocked.Increment(ref _stuck);
+                try { Stuck?.Invoke(items, waited); } catch { /* the alert hook must not stop the retries */ }
+            }
             req.RequestId = conn.NextRequestId();
             var tcs = new TaskCompletionSource<PublishReply>(TaskCreationOptions.RunContinuationsAsynchronously);
             conn.PendingPublishes[req.RequestId] = tcs;
@@ -42,5 +64,10 @@ public sealed class OctopusProducer(OctopusConnection conn)
             backoff = TimeSpan.FromMilliseconds(Math.Min(2000, backoff.TotalMilliseconds * 2));
         }
         throw new TimeoutException($"publish not acknowledged after {MaxAttempts} attempts");
+        }
+        finally
+        {
+            if (alerted) Interlocked.Decrement(ref _stuck);
+        }
     }
 }

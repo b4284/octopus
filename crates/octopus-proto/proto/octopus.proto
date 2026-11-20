@@ -43,6 +43,7 @@ enum PublishStatus {
   PUBLISH_STORED = 1;
   PUBLISH_DUPLICATE = 2;          // already stored or already applied: a retry
   PUBLISH_GROUP_MISMATCH = 3;     // the source belongs to another group: rejected
+  PUBLISH_CONFLICT = 4;           // (source, seq) is stored with a different body: a reused number, rejected
 }
 
 message PublishReply {
@@ -78,6 +79,8 @@ message WorkerCredit {
   repeated string groups = 3;
   uint32 credit = 4;
   bool reset = 5;                 // the outstanding credit with this dispatcher is exactly `credit` (after a reconnect)
+  uint32 slots = 6;               // the worker's slots (0 = not stated): a dispatcher never has more than this many
+                                  // of its events out with the worker, whatever the credit says
 }
 
 message Delivery {

@@ -11,6 +11,7 @@
 //! | `OCTOPUS_MQTT_HOST`, `OCTOPUS_MQTT_PORT` | `127.0.0.1`, `1883` |
 //! | `OCTOPUS_MQTT_USER`, `OCTOPUS_MQTT_PASSWORD` | none |
 //! | `OCTOPUS_LEASE_TTL_MS`, `OCTOPUS_TICK_MS`, `OCTOPUS_DRAIN_MS` | `3000`, `500`, `5000` |
+//! | `OCTOPUS_GAP_ALERT_MS`, `OCTOPUS_GAP_CHECK_MS` (report a source stopped by a missing event) | `30000`, `10000` |
 //! | `OCTOPUS_DELIVERY_TIMEOUT_MS` | `30000` |
 //! | `OCTOPUS_PUBLISH_EXECUTORS`, `OCTOPUS_COMMIT_EXECUTORS` | `16`, `16` |
 //! | `RUST_LOG` | `info` |
@@ -45,6 +46,8 @@ async fn main() {
     cfg.lease_ttl = env_ms("OCTOPUS_LEASE_TTL_MS", 3000);
     cfg.tick = env_ms("OCTOPUS_TICK_MS", 500);
     cfg.drain = env_ms("OCTOPUS_DRAIN_MS", 5000);
+    cfg.gap_alert = env_ms("OCTOPUS_GAP_ALERT_MS", 30_000);
+    cfg.gap_check = env_ms("OCTOPUS_GAP_CHECK_MS", 10_000);
     cfg.delivery_timeout = env_ms("OCTOPUS_DELIVERY_TIMEOUT_MS", 30_000);
     // concurrent database transactions for publishes and for commits/removals (batches form while they run)
     cfg.publish_executors = env("OCTOPUS_PUBLISH_EXECUTORS", "16").parse().unwrap_or(16);

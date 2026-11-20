@@ -8,7 +8,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use deadpool_postgres::{Manager, ManagerConfig, Pool, RecyclingMethod};
 use octopus_core::{
-    Backend, Commit, CommitOutcome, Error, Event, EventKey, Head, HeadRequest, Lease, Member, PublishOutcome, Result,
+    Backend, Commit, CommitOutcome, Error, Event, EventKey, Gap, Head, HeadRequest, Lease, Member, PublishOutcome, Result,
 };
 use tokio_postgres::NoTls;
 
@@ -105,12 +105,13 @@ impl Backend for PgBackend {
         let src: Vec<&str> = events.iter().map(|e| e.key.source.as_str()).collect();
         let seq: Vec<i64> = events.iter().map(|e| e.key.seq).collect();
         let body: Vec<&[u8]> = events.iter().map(|e| e.body.as_ref()).collect();
+        let hash: Vec<i64> = events.iter().map(|e| xxhash_rust::xxh3::xxh3_64(&e.body) as i64).collect();
         if seq.iter().any(|&q| q < 1) {
             return Err(Error::Invalid("seq starts at 1".into()));
         }
         let c = self.client().await?;
-        let st = c.prepare_cached(&self.q("SELECT octopus.publish($1, $2, $3, $4)")).await.map_err(db)?;
-        let row = c.query_one(&st, &[&grp, &src, &seq, &body]).await.map_err(db)?;
+        let st = c.prepare_cached(&self.q("SELECT octopus.publish($1, $2, $3, $4, $5)")).await.map_err(db)?;
+        let row = c.query_one(&st, &[&grp, &src, &seq, &body, &hash]).await.map_err(db)?;
         let codes: Vec<i16> = row.get(0);
         Ok(codes
             .into_iter()
@@ -118,6 +119,7 @@ impl Backend for PgBackend {
                 0 => PublishOutcome::Stored,
                 3 => PublishOutcome::StoredHead,
                 2 => PublishOutcome::GroupMismatch,
+                4 => PublishOutcome::Conflict,
                 _ => PublishOutcome::Duplicate,
             })
             .collect())
@@ -363,6 +365,35 @@ impl Backend for PgBackend {
         c.execute(&self.q("DELETE FROM octopus.lease WHERE owner = $1"), &[&member]).await.map_err(db)?;
         c.execute(&self.q("DELETE FROM octopus.member WHERE member_id = $1"), &[&member]).await.map_err(db)?;
         Ok(())
+    }
+
+    async fn gaps(&self, groups: &[String], older_than: Duration, limit: i32) -> Result<Vec<Gap>> {
+        if groups.is_empty() {
+            return Ok(vec![]);
+        }
+        let older_us = older_than.as_micros().min(i64::MAX as u128) as i64;
+        let c = self.client().await?;
+        let st = c
+            .prepare_cached(&self.q("SELECT s.grp, s.source, s.last_seq, min(e.seq), \
+                        (extract(epoch FROM now() - min(e.enqueued_at)) * 1000000)::bigint \
+                   FROM octopus.source s JOIN octopus.event e ON e.source = s.source AND e.seq > s.last_seq \
+                  WHERE s.grp = ANY($1) \
+                  GROUP BY s.grp, s.source, s.last_seq \
+                 HAVING min(e.seq) > s.last_seq + 1 AND min(e.enqueued_at) < now() - $2::bigint * interval '1 microsecond' \
+                  ORDER BY 5 DESC LIMIT $3::int"))
+            .await
+            .map_err(db)?;
+        let rows = c.query(&st, &[&groups, &older_us, &limit]).await.map_err(db)?;
+        Ok(rows
+            .iter()
+            .map(|r| Gap {
+                group: r.get(0),
+                source: r.get(1),
+                cursor: r.get(2),
+                first_stored: r.get(3),
+                waiting: Duration::from_micros(r.get::<_, i64>(4).max(0) as u64),
+            })
+            .collect())
     }
 
     async fn purge_applied(&self, limit: i32) -> Result<i64> {

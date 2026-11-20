@@ -140,7 +140,7 @@ Octopus owns only its own tables, in the `octopus` schema:
 
 | table | key | holds |
 |---|---|---|
-| `event` | `(source, seq)` | group, body, enqueued time, attempt count, `not_before` (retry delay) |
+| `event` | `(source, seq)` | group, body, body hash, enqueued time, attempt count, `not_before` (retry delay) |
 | `source` | `source` | group (fixed by the first publish), `last_seq` (the cursor) |
 | `grp` | `name` | every group ever published to |
 | `member` | `member_id` | address, heartbeat (database time) |
@@ -202,8 +202,12 @@ All messages are idempotent, so any of them can be retried.
 2. The instance adds the event to a batch with every concurrent publish. There is no timer: a batch is whatever
    arrived while the previous batch was being written. It then runs
    `INSERT … SELECT … WHERE seq > cursor ON CONFLICT DO NOTHING`.
-3. The instance replies `Accepted` or `Duplicate`, **only after** the commit has been replicated
-   synchronously.
+3. The instance replies `Stored`, `Duplicate` or `Conflict`, **only after** the commit has been replicated
+   synchronously. `Conflict`: this `(source, seq)` is stored with a different body (the dispatcher compares a
+   64-bit hash), so the source reused a number; nothing changes. A repeat of an event already applied cannot be
+   compared (its row is gone) and is a `Duplicate`.
+4. Producers retry until acknowledged (by default without limit: giving up would leave a gap that holds back the
+   source). A publish still unacknowledged after 30 s is reported (warning, gauge, callback) while it keeps retrying.
 
 What happens next:
 - **Fast path:** if this instance owns the group, the event goes straight into its in-memory ready queue and
@@ -226,6 +230,13 @@ buffers without limit and never drops.
    - Each dispatcher advertises how many heads per group it has ready.
    - Each worker grants credits to the dispatchers from its **free slots only**. The credits a worker has
      granted never exceed its free slots, so no event waits inside a busy worker (G6).
+   - The client enforces this as an invariant (deliveries held + credits granted <= slots), after every result
+     and every second, and tells an owner its corrected credit. A delivery whose result is sent no longer counts
+     (its credit is already back). Deliveries are tracked one by one, never by source.
+   - The worker also states its slots with every credit; a dispatcher never has more than that many of its events
+     out with the worker, whatever the credit says (a guard against a client whose accounting drifted).
+   - Progress reports ("still working") extend only the reporting worker's own deliveries, and a failure report
+     counts only from the worker that holds the event now.
 3. **Deliver.** The dispatcher sends `Deliver(group, source, seq, body, preloaded state, attempt)` and records it
    in memory as handed out.
    - Workers call external systems (§10), so **`(source_id, seq)` is the idempotency key** for those calls.
@@ -340,7 +351,9 @@ Postgres comes first. SQL Server (availability group with synchronous commit) an
 ## 10. Decisions (owner, 2026-11-20)
 
 1. **Ordering:** each source stamps a gapless per-source sequence number. Producers can publish concurrently and
-   retry; a gap holds back its source and raises an alert.
+   retry; a gap holds back its source and raises an alert: every 10 s each dispatcher looks for owned sources whose
+   next event is missing while a later one has waited over 30 s (`OCTOPUS_GAP_ALERT_MS`), and reports each once
+   (`gaps_open` gauge). Healing gaps automatically is planned (benchmark backlog B23).
 2. **Sites:** two DCs plus a witness site (etcd only). §4.1 has the replica placement.
 3. **Side effects:** workers also call external systems. `(source_id, seq)` is passed with every delivery as the
    idempotency key.

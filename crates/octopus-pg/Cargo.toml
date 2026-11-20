@@ -15,6 +15,7 @@ tokio.workspace = true
 tokio-postgres.workspace = true
 deadpool-postgres.workspace = true
 tracing.workspace = true
+xxhash-rust = { version = "0.8.21", features = ["xxh3"] }
 
 [dev-dependencies]
 tokio.workspace = true

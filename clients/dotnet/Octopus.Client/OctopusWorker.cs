@@ -13,6 +13,7 @@ public sealed class OctopusDelivery
     public required string MemberInbox { get; init; }
     public long ReceivedAt { get; init; } = Environment.TickCount64;
     internal int Done;
+    internal int Reported;
 }
 
 /// <summary>
@@ -38,6 +39,9 @@ public sealed class OctopusWorker : IAsyncDisposable
     private readonly CancellationTokenSource _cts = new();
     private readonly Task _refresh;
     private int _rr;
+    // deliveries whose result is sent but whose slot is not released yet: their credit is already back with the
+    // dispatcher, so they no longer count against the slots
+    private int _reportedHeld;
 
     public ChannelReader<OctopusDelivery> Deliveries => _deliveries.Reader;
     public TimeSpan ResultTimeout { get; set; } = TimeSpan.FromSeconds(10);
@@ -127,6 +131,7 @@ public sealed class OctopusWorker : IAsyncDisposable
                 if (OwnerMembers().Contains(d.Member)) _granted[d.Member] = _granted.GetValueOrDefault(d.Member) + 1;
         }
         Interlocked.Increment(ref ResultsSent);
+        if (_running.ContainsKey(d) && Interlocked.Exchange(ref d.Reported, 1) == 0) Interlocked.Increment(ref _reportedHeld);
         _conn.Send(alive ? d.MemberInbox : _conn.Topics.Any, new Envelope { Results = batch }, urgent: true);
         // the implicit return assumes the delivery came out of a credit; if this worker holds more than its slots
         // (deliveries crossed a credit change), correct the owners now instead of letting the excess persist
@@ -142,7 +147,8 @@ public sealed class OctopusWorker : IAsyncDisposable
         var changed = new List<(string, int)>();
         lock (_gate)
         {
-            int excess = _running.Count + _granted.Values.Sum() - _slots;
+            int held = _running.Count - Volatile.Read(ref _reportedHeld);
+            int excess = held + _granted.Values.Sum() - _slots;
             while (excess > 0)
             {
                 var top = _granted.Where(kv => kv.Value > 0).OrderByDescending(kv => kv.Value).Select(kv => kv.Key).FirstOrDefault();
@@ -161,7 +167,7 @@ public sealed class OctopusWorker : IAsyncDisposable
     public void Release(OctopusDelivery d)
     {
         if (Interlocked.Exchange(ref d.Done, 1) == 1) return;
-        _running.TryRemove(d, out _);
+        if (_running.TryRemove(d, out _) && Volatile.Read(ref d.Reported) == 1) Interlocked.Decrement(ref _reportedHeld);
         Rebalance();
     }
 
@@ -238,7 +244,7 @@ public sealed class OctopusWorker : IAsyncDisposable
     private void SendCredit(string member, int credit, bool reset)
     {
         if (!_conn.Members.TryGetValue(member, out var inbox)) return;
-        var c = new WorkerCredit { WorkerId = _id, Inbox = _conn.Inbox, Credit = (uint)credit, Reset = reset };
+        var c = new WorkerCredit { WorkerId = _id, Inbox = _conn.Inbox, Credit = (uint)credit, Reset = reset, Slots = (uint)_slots };
         c.Groups.AddRange(_groups);
         _conn.Send(inbox, new Envelope { Credit = c });
     }

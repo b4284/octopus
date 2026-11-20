@@ -43,6 +43,10 @@ pub struct Config {
     pub fetch_max_groups: usize,
     pub purge_every: Duration,
     pub stats_every: Duration,
+    /// Report a source whose next event is missing while a later one has waited this long (a gap).
+    pub gap_alert: Duration,
+    /// Look for gaps this often.
+    pub gap_check: Duration,
     /// Hand out events known to be heads (from publishes and "done" removals) without reading the group's heads.
     /// Off when contexts are preloaded by a load hook (the fast path has no context).
     pub fast_path: bool,
@@ -67,6 +71,8 @@ impl Config {
             fetch_max_groups: 64,
             purge_every: Duration::from_secs(30),
             stats_every: Duration::from_secs(5),
+            gap_alert: Duration::from_secs(30),
+            gap_check: Duration::from_secs(10),
             fast_path: true,
         }
     }
@@ -245,6 +251,24 @@ struct WorkerState {
     groups: Vec<String>,
     credit: u32,
     last_seen: Instant,
+    /// slots the worker declared (0 = not stated)
+    slots: u32,
+    /// deliveries of this dispatcher out with the worker (recomputed exactly every sweep)
+    held: u32,
+}
+
+impl WorkerState {
+    /// Credit to spend, and (if the worker declared its slots) room below them: a client whose credit accounting
+    /// drifted cannot be handed more events than it can run.
+    fn usable(&self) -> bool {
+        self.credit > 0 && (self.slots == 0 || self.held < self.slots)
+    }
+}
+
+fn unhold(workers: &mut HashMap<String, WorkerState>, worker: &str) {
+    if let Some(w) = workers.get_mut(worker) {
+        w.held = w.held.saturating_sub(1);
+    }
 }
 
 #[derive(Default)]
@@ -295,7 +319,7 @@ impl Core {
         let Core { groups, workers, by_group, .. } = self;
         for (g, st) in groups.iter_mut().filter(|(_, st)| st.serving && !st.ready.is_empty()) {
             let Some(ws) = by_group.get(g) else { continue };
-            let credited = ws.iter().any(|w| workers.get(w).is_some_and(|x| x.credit > 0));
+            let credited = ws.iter().any(|w| workers.get(w).is_some_and(|x| x.usable()));
             if !credited {
                 // events are ready but the group's workers hold no credit here: ask them to move idle credit
                 if st.last_demand.is_none_or(|t| now.duration_since(t) >= Duration::from_millis(100)) {
@@ -317,7 +341,7 @@ impl Core {
             }
             while !st.ready.is_empty() {
                 // the credited worker with the most credit
-                let Some(wid) = ws.iter().filter(|w| workers.get(*w).is_some_and(|x| x.credit > 0)).max_by_key(|w| workers[*w].credit)
+                let Some(wid) = ws.iter().filter(|w| workers.get(*w).is_some_and(|x| x.usable())).max_by_key(|w| workers[*w].credit)
                 else {
                     break;
                 };
@@ -328,6 +352,7 @@ impl Core {
                 let wid = wid.clone();
                 let w = workers.get_mut(&wid).unwrap();
                 w.credit -= 1;
+                w.held += 1;
                 st.inflight.insert(r.head.key.source.clone(), InFlight { seq: r.head.key.seq, worker: wid.clone(), deadline: now + timeout, since: now, warned: false });
                 let possibly_redelivered =
                     st.suspect.contains(&(r.head.key.source.clone(), r.head.key.seq)) || r.head.enqueued_at_us <= st.claimed_us;
@@ -408,6 +433,8 @@ impl Core {
 pub struct Stats {
     pub published: AtomicU64,
     pub publish_duplicates: AtomicU64,
+    /// publishes rejected because the (source, seq) is stored with a different body
+    pub publish_conflicts: AtomicU64,
     pub publish_batches: AtomicU64,
     pub applied: AtomicU64,
     /// "done" reports for events the worker already completed in its own transaction
@@ -427,6 +454,8 @@ pub struct Stats {
     pub claims: AtomicU64,
     pub releases: AtomicU64,
     pub leases_lost: AtomicU64,
+    /// sources of owned groups currently stopped by a missing event (gauge, from the last gap check)
+    pub gaps_open: AtomicU64,
 }
 
 struct PendingPublish {
@@ -615,7 +644,13 @@ impl<B: Backend> Dispatcher<B> {
                             // done = the worker committed: free the source and hand out its next event now; the
                             // cursor is written to the database with the next flush (~100 ms)
                             if it.ok && it.done && self.cfg.fast_path {
-                                if let Some(st) = core.groups.get_mut(&it.group) {
+                                let Core { groups, workers, .. } = &mut *core;
+                                if let Some(st) = groups.get_mut(&it.group) {
+                                    if let Some(f) = st.inflight.get(&it.source).filter(|f| f.seq == it.seq) {
+                                        let w = f.worker.clone();
+                                        st.inflight.remove(&it.source);
+                                        unhold(workers, &w);
+                                    }
                                     st.done(&it.group, &it.source, it.seq);
                                 }
                                 let c = core.unflushed.entry(it.source.clone()).or_insert(0);
@@ -700,6 +735,7 @@ impl<B: Backend> Dispatcher<B> {
             Some(w) => {
                 w.last_seen = now;
                 w.credit = if c.reset { c.credit } else { w.credit.saturating_add(c.credit) };
+                w.slots = c.slots;
                 w.inbox = c.inbox;
                 let changed = w.groups != c.groups;
                 if changed {
@@ -710,7 +746,7 @@ impl<B: Backend> Dispatcher<B> {
             None => {
                 core.workers.insert(
                     c.worker_id.clone(),
-                    WorkerState { inbox: c.inbox, groups: c.groups, credit: c.credit, last_seen: now },
+                    WorkerState { inbox: c.inbox, groups: c.groups, credit: c.credit, last_seen: now, slots: c.slots, held: 0 },
                 );
                 true
             }
@@ -798,6 +834,11 @@ impl<B: Backend> Dispatcher<B> {
                                     v1::PublishStatus::PublishDuplicate as i32
                                 }
                                 PublishOutcome::GroupMismatch => v1::PublishStatus::PublishGroupMismatch as i32,
+                                PublishOutcome::Conflict => {
+                                    self.stats.publish_conflicts.fetch_add(1, Relaxed);
+                                    warn!(source = %it.source, seq = it.seq, "publish conflict: this (source, seq) is stored with a different body");
+                                    v1::PublishStatus::PublishConflict as i32
+                                }
                             })
                             .collect();
                         v1::PublishReply { request_id: p.request_id, status, error: String::new() }
@@ -1005,9 +1046,12 @@ impl<B: Backend> Dispatcher<B> {
         {
             let mut core = self.core.lock().unwrap();
             for (g, s, q, outcome_known, next, ok, w) in done {
-                if let Some(st) = core.groups.get_mut(&g) {
+                let Core { groups, workers, .. } = &mut *core;
+                if let Some(st) = groups.get_mut(&g) {
                     if st.inflight.get(&s).is_some_and(|f| f.seq == q && (ok || f.worker == w)) {
-                        st.inflight.remove(&s);
+                        if let Some(f) = st.inflight.remove(&s) {
+                            unhold(workers, &f.worker);
+                        }
                     } else if !ok && st.inflight.contains_key(&s) {
                         // handed out again meanwhile: that delivery stands
                         self.stats.stale_failures.fetch_add(1, Relaxed);
@@ -1270,6 +1314,16 @@ impl<B: Backend> Dispatcher<B> {
                         woke = true;
                     }
                 }
+                // the exact count of deliveries out per worker (corrects anything the incremental count missed)
+                let mut held: HashMap<String, u32> = HashMap::new();
+                for st in core.groups.values() {
+                    for f in st.inflight.values() {
+                        *held.entry(f.worker.clone()).or_default() += 1;
+                    }
+                }
+                for (id, w) in core.workers.iter_mut() {
+                    w.held = held.get(id).copied().unwrap_or(0);
+                }
                 let ttl = self.cfg.worker_ttl;
                 let gone: Vec<String> =
                     core.workers.iter().filter(|(_, w)| now.duration_since(w.last_seen) > ttl).map(|(id, _)| id.clone()).collect();
@@ -1401,10 +1455,31 @@ impl<B: Backend> Dispatcher<B> {
 
     async fn housekeeping_loop(self: Arc<Self>, mut stop: watch::Receiver<bool>) {
         let mut last_purge = Instant::now();
+        let mut last_gap_check = Instant::now();
+        // (source, cursor) of gaps already reported: each gap is reported once
+        let mut reported: HashSet<(String, i64)> = HashSet::new();
         loop {
             tokio::select! {
-                _ = tokio::time::sleep(self.cfg.stats_every) => {}
+                _ = tokio::time::sleep(self.cfg.stats_every.min(self.cfg.gap_check)) => {}
                 _ = stop.changed() => return,
+            }
+            if last_gap_check.elapsed() >= self.cfg.gap_check {
+                last_gap_check = Instant::now();
+                let owned: Vec<String> = self.core.lock().unwrap().groups.iter().filter(|(_, g)| g.serving).map(|(n, _)| n.clone()).collect();
+                match self.backend.gaps(&owned, self.cfg.gap_alert, 1000).await {
+                    Ok(gaps) => {
+                        self.stats.gaps_open.store(gaps.len() as u64, Relaxed);
+                        let now_open: HashSet<(String, i64)> = gaps.iter().map(|g| (g.source.clone(), g.cursor)).collect();
+                        for g in &gaps {
+                            if reported.insert((g.source.clone(), g.cursor)) {
+                                warn!(group = %g.group, source = %g.source, missing_from = g.cursor + 1, missing_to = g.first_stored - 1,
+                                      waiting_s = g.waiting.as_secs(), "gap: the source's next event is missing, later events wait");
+                            }
+                        }
+                        reported.retain(|k| now_open.contains(k));
+                    }
+                    Err(e) => warn!(error = %e, "gap check failed"),
+                }
             }
             if last_purge.elapsed() >= self.cfg.purge_every {
                 last_purge = Instant::now();
@@ -1429,7 +1504,8 @@ impl<B: Backend> Dispatcher<B> {
                 published = s.published.load(Relaxed), applied = s.applied.load(Relaxed),
                 completed_by_worker = s.completed_by_worker.load(Relaxed),
                 duplicates = s.duplicates.load(Relaxed), failures = s.failures.load(Relaxed),
-                timeouts = s.timeouts.load(Relaxed), stale_failures = s.stale_failures.load(Relaxed), commit_batches = s.commit_batches.load(Relaxed),
+                timeouts = s.timeouts.load(Relaxed), stale_failures = s.stale_failures.load(Relaxed), gaps_open = s.gaps_open.load(Relaxed),
+                publish_conflicts = s.publish_conflicts.load(Relaxed), commit_batches = s.commit_batches.load(Relaxed),
                 fetches = s.fetches.load(Relaxed), "stats"
             );
         }

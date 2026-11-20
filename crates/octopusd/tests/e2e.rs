@@ -4,7 +4,7 @@
 
 use std::collections::HashMap;
 use std::process::{Child, Command, Stdio};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
@@ -324,6 +324,92 @@ async fn workers_commit_their_own_writes_and_report_done() {
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
     assert_eq!(unflagged.load(Ordering::Relaxed), 0, "every repeated delivery must be flagged possibly_redelivered");
+    let _ = stop_tx.send(true);
+    for w in workers {
+        let _ = w.await;
+    }
+}
+
+/// Applies each source strictly in order in memory, counting anything out of order.
+struct OrderCheck {
+    last: Mutex<HashMap<String, i64>>,
+    out_of_order: Arc<AtomicU64>,
+    applied: Arc<AtomicU64>,
+}
+
+impl Handler for OrderCheck {
+    async fn handle(&self, d: Delivery) -> Outcome {
+        let mut last = self.last.lock().unwrap();
+        let l = last.entry(d.source.clone()).or_insert(0);
+        if d.seq == *l + 1 {
+            *l = d.seq;
+            self.applied.fetch_add(1, Ordering::Relaxed);
+        } else if d.seq > *l + 1 {
+            self.out_of_order.fetch_add(1, Ordering::Relaxed);
+        } // else: a repeat of something applied
+        Outcome::Done
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn events_published_out_of_order_lost_and_repeated_are_handed_out_in_order() {
+    let ns = uniq("e2e");
+    let (groups, sources) = setup(&ns, 3, 30).await;
+    let seqs: i64 = 20;
+    let _d1 = Dispatcher::start_with(&ns, "d1", None);
+    let _d2 = Dispatcher::start_with(&ns, "d2", None);
+    let (stop_tx, stop_rx) = watch::channel(false);
+    let (bad, applied) = (Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)));
+    // one shared order check: both workers serve every group, so a source's events go to either
+    let check = Arc::new(OrderCheck { last: Mutex::default(), out_of_order: bad.clone(), applied: applied.clone() });
+    struct Shared(Arc<OrderCheck>);
+    impl Handler for Shared {
+        async fn handle(&self, d: Delivery) -> Outcome {
+            self.0.handle(d).await
+        }
+    }
+    let mut workers = vec![];
+    for i in 0..2 {
+        let id = format!("{ns}-w{i}");
+        let (w, rx) = Worker::connect(MqttConfig::new("127.0.0.1", 1883, id.clone()), WorkerConfig::new(id, ns.clone(), groups.clone(), 8), Shared(check.clone()))
+            .await
+            .unwrap();
+        workers.push(tokio::spawn(w.run(rx, stop_rx.clone())));
+    }
+    let producer = Producer::connect(MqttConfig::new("127.0.0.1", 1883, format!("{ns}-p")), &ns, &format!("{ns}-p")).await.unwrap();
+    // every event at once, in a scrambled order; about 1 in 10 "lost" (sent 3 s late); 1 in 7 sent twice
+    let mut all: Vec<(usize, i64)> = (0..sources.len()).flat_map(|i| (1..=seqs).map(move |q| (i, q))).collect();
+    all.sort_by_key(|&(i, q)| (q as usize * 7919 + i * 104_729) % 1_000_003);
+    let mut tasks = vec![];
+    for (i, q) in all {
+        let (p, s, g) = (producer.clone(), sources[i].clone(), groups[i % groups.len()].clone());
+        let late = (i as i64 * 31 + q * 17) % 10 == 0 && q > 1;
+        tasks.push(tokio::spawn(async move {
+            if late {
+                tokio::time::sleep(Duration::from_secs(3)).await;
+            }
+            let item = PublishItem { group: g, source: s.clone(), seq: q, body: Bytes::from(format!("{s}/{q}")) };
+            p.publish(vec![item.clone()]).await.expect("publish");
+            if q % 7 == 0 {
+                p.publish(vec![item]).await.expect("republish");
+            }
+        }));
+    }
+    for t in tasks {
+        t.await.unwrap();
+    }
+    let want = sources.len() as u64 * seqs as u64;
+    let until = Instant::now() + Duration::from_secs(60);
+    while applied.load(Ordering::Relaxed) < want {
+        assert!(Instant::now() < until, "only {} of {want} applied", applied.load(Ordering::Relaxed));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(bad.load(Ordering::Relaxed), 0, "an event was handed out before its predecessor was done");
+    let until = Instant::now() + Duration::from_secs(20);
+    while backlog(&ns).await > 0 {
+        assert!(Instant::now() < until, "backlog did not drain");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
     let _ = stop_tx.send(true);
     for w in workers {
         let _ = w.await;

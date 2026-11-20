@@ -283,3 +283,38 @@ async fn concurrent_chaos_applies_each_event_once_in_order() {
         assert_eq!(seqs, (1..=N).collect::<Vec<_>>(), "source {s}: every seq applied exactly once");
     }
 }
+
+#[tokio::test]
+async fn a_reused_seq_with_a_different_body_is_a_conflict() {
+    let b = backend().await;
+    let (g, s) = (uniq("g-conf"), uniq("s-conf"));
+    assert_eq!(b.publish(&[ev(&g, &s, 1, "a"), ev(&g, &s, 2, "b")]).await.unwrap(), vec![PublishOutcome::StoredHead, PublishOutcome::Stored]);
+    // the same body again: a retry; a different body under a stored number: a conflict, nothing changes
+    assert_eq!(b.publish(&[ev(&g, &s, 2, "b")]).await.unwrap(), vec![PublishOutcome::Duplicate]);
+    assert_eq!(b.publish(&[ev(&g, &s, 2, "B")]).await.unwrap(), vec![PublishOutcome::Conflict]);
+    let got = b.read_events(&[EventKey::new(&s, 2)]).await.unwrap();
+    assert_eq!(got[0].body, Bytes::from("b"));
+    // once applied, the row is gone: a repeat cannot be compared and is a duplicate
+    b.advance(&[(s.clone(), 2)]).await.unwrap();
+    assert_eq!(b.publish(&[ev(&g, &s, 2, "B")]).await.unwrap(), vec![PublishOutcome::Duplicate]);
+}
+
+#[tokio::test]
+async fn gaps_report_sources_whose_next_event_is_missing() {
+    let b = backend().await;
+    let g = uniq("g-gap");
+    let (holed, whole) = (uniq("s-holed"), uniq("s-whole"));
+    // holed: 1 applied, 2 and 3 missing, 4 and 5 stored; whole: 1, 2 stored (no gap)
+    b.publish(&[ev(&g, &holed, 1, "x"), ev(&g, &holed, 4, "x"), ev(&g, &holed, 5, "x"), ev(&g, &whole, 1, "x"), ev(&g, &whole, 2, "x")])
+        .await
+        .unwrap();
+    b.advance(&[(holed.clone(), 1)]).await.unwrap();
+    // not old enough yet
+    assert!(b.gaps(&[g.clone()], Duration::from_secs(60), 10).await.unwrap().is_empty());
+    let gaps = b.gaps(&[g.clone()], Duration::ZERO, 10).await.unwrap();
+    assert_eq!(gaps.len(), 1, "{gaps:?}");
+    assert_eq!((gaps[0].source.as_str(), gaps[0].cursor, gaps[0].first_stored), (holed.as_str(), 1, 4));
+    // the missing events arrive: no gap any more
+    b.publish(&[ev(&g, &holed, 2, "x"), ev(&g, &holed, 3, "x")]).await.unwrap();
+    assert!(b.gaps(&[g.clone()], Duration::ZERO, 10).await.unwrap().is_empty());
+}
