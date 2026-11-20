@@ -31,7 +31,8 @@ public sealed class OctopusWorker : IAsyncDisposable
     private readonly string[] _groups;
     private readonly int _slots;
     private readonly Channel<OctopusDelivery> _deliveries = Channel.CreateUnbounded<OctopusDelivery>();
-    private readonly ConcurrentDictionary<string, OctopusDelivery> _running = new();
+    // every delivery received and not yet given up (by identity: two deliveries of one source are two entries)
+    private readonly ConcurrentDictionary<OctopusDelivery, byte> _running = new(ReferenceEqualityComparer.Instance);
     private readonly object _gate = new();
     private readonly Dictionary<string, int> _granted = new();   // member -> credits granted, not yet used
     private readonly CancellationTokenSource _cts = new();
@@ -67,7 +68,7 @@ public sealed class OctopusWorker : IAsyncDisposable
     {
         lock (_gate) _granted[member] = Math.Max(0, _granted.GetValueOrDefault(member) - 1);
         var od = new OctopusDelivery { Item = item, Member = member, MemberInbox = memberInbox };
-        _running[item.Source] = od;
+        _running[od] = 0;
         Interlocked.Increment(ref Received);
         _deliveries.Writer.TryWrite(od);
     }
@@ -97,7 +98,10 @@ public sealed class OctopusWorker : IAsyncDisposable
         SendResult(d, r);
     }
 
-    /// <summary>The event failed: offer it again after <paramref name="retryDelay"/>.</summary>
+    /// <summary>
+    /// The event failed: offer it again after <paramref name="retryDelay"/>. This gives the delivery up, so it also
+    /// frees its slot (as <see cref="Release"/> does): no progress is reported for it any more.
+    /// </summary>
     public Task Fail(OctopusDelivery d, TimeSpan retryDelay, CancellationToken ct = default)
     {
         var r = new WorkResult
@@ -106,6 +110,7 @@ public sealed class OctopusWorker : IAsyncDisposable
             Ok = false, RetryDelayMs = (uint)Math.Clamp(retryDelay.TotalMilliseconds, 1, uint.MaxValue), WorkerId = _id,
         };
         SendResult(d, r);
+        Release(d);
         return Task.CompletedTask;
     }
 
@@ -123,13 +128,40 @@ public sealed class OctopusWorker : IAsyncDisposable
         }
         Interlocked.Increment(ref ResultsSent);
         _conn.Send(alive ? d.MemberInbox : _conn.Topics.Any, new Envelope { Results = batch }, urgent: true);
+        // the implicit return assumes the delivery came out of a credit; if this worker holds more than its slots
+        // (deliveries crossed a credit change), correct the owners now instead of letting the excess persist
+        foreach (var (m, n) in Clamp()) SendCredit(m, n, reset: true);
+    }
+
+    /// <summary>
+    /// The invariant: deliveries held plus credits granted never exceed the slots. Takes back any excess (largest
+    /// grants first) and returns the owners whose credit changed, with their new amount.
+    /// </summary>
+    private List<(string Member, int Credit)> Clamp()
+    {
+        var changed = new List<(string, int)>();
+        lock (_gate)
+        {
+            int excess = _running.Count + _granted.Values.Sum() - _slots;
+            while (excess > 0)
+            {
+                var top = _granted.Where(kv => kv.Value > 0).OrderByDescending(kv => kv.Value).Select(kv => kv.Key).FirstOrDefault();
+                if (top is null) break;
+                int take = Math.Min(excess, _granted[top]);
+                _granted[top] -= take;
+                excess -= take;
+                changed.RemoveAll(c => c.Item1 == top);
+                changed.Add((top, _granted[top]));
+            }
+        }
+        return changed;
     }
 
     /// <summary>The application is done with the delivery: its slot is free again.</summary>
     public void Release(OctopusDelivery d)
     {
         if (Interlocked.Exchange(ref d.Done, 1) == 1) return;
-        _running.TryRemove(new KeyValuePair<string, OctopusDelivery>(d.Item.Source, d));
+        _running.TryRemove(d, out _);
         Rebalance();
     }
 
@@ -221,10 +253,11 @@ public sealed class OctopusWorker : IAsyncDisposable
         {
             while (await timer.WaitForNextTickAsync(_cts.Token))
             {
+                Clamp();
                 Dictionary<string, int> resync;
                 lock (_gate) resync = OwnerMembers().ToDictionary(m => m, m => _granted.GetValueOrDefault(m));
                 foreach (var (m, n) in resync) SendCredit(m, n, reset: true);
-                foreach (var g in _running.Values
+                foreach (var g in _running.Keys
                              .Where(d => Environment.TickCount64 - d.ReceivedAt >= ProgressAfter.TotalMilliseconds && _conn.Members.ContainsKey(d.Member))
                              .GroupBy(d => d.MemberInbox))
                 {
@@ -236,6 +269,13 @@ public sealed class OctopusWorker : IAsyncDisposable
             }
         }
         catch (OperationCanceledException) { }
+    }
+
+    /// <summary>Diagnostics: slots, deliveries held, credits granted per owner, deliveries not yet taken.</summary>
+    public string Describe()
+    {
+        lock (_gate)
+            return $"{_id}: slots {_slots}, running {_running.Count}, queued {_deliveries.Reader.Count}, granted [{string.Join(", ", _granted.Select(kv => $"{kv.Key}={kv.Value}"))}], received {Received}, results {ResultsSent}";
     }
 
     public async ValueTask DisposeAsync()

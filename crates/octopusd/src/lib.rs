@@ -80,9 +80,18 @@ struct ReadyHead {
     context: Option<Bytes>,
 }
 
+/// A delivery outstanding this long is reported (once): its worker keeps it alive with progress reports.
+const LONG_OUTSTANDING: Duration = Duration::from_secs(60);
+
 struct InFlight {
     seq: i64,
+    /// The worker it was handed to: only its progress reports extend the deadline, and only its failure reports
+    /// give the event back (a late report from an earlier holder must not cancel the current delivery).
+    worker: String,
     deadline: Instant,
+    since: Instant,
+    /// already reported as long-outstanding
+    warned: bool,
 }
 
 #[derive(Default)]
@@ -319,7 +328,7 @@ impl Core {
                 let wid = wid.clone();
                 let w = workers.get_mut(&wid).unwrap();
                 w.credit -= 1;
-                st.inflight.insert(r.head.key.source.clone(), InFlight { seq: r.head.key.seq, deadline: now + timeout });
+                st.inflight.insert(r.head.key.source.clone(), InFlight { seq: r.head.key.seq, worker: wid.clone(), deadline: now + timeout, since: now, warned: false });
                 let possibly_redelivered =
                     st.suspect.contains(&(r.head.key.source.clone(), r.head.key.seq)) || r.head.enqueued_at_us <= st.claimed_us;
                 out.entry(w.inbox.clone()).or_default().push(v1::Delivery {
@@ -412,6 +421,8 @@ pub struct Stats {
     pub fetches: AtomicU64,
     pub fetched_heads: AtomicU64,
     pub timeouts: AtomicU64,
+    /// failure reports from a worker that no longer holds the event (ignored)
+    pub stale_failures: AtomicU64,
     pub hints_sent: AtomicU64,
     pub claims: AtomicU64,
     pub releases: AtomicU64,
@@ -616,6 +627,21 @@ impl<B: Backend> Dispatcher<B> {
                     if self.cfg.fast_path {
                         r.items.retain(|it| !(it.ok && it.done));
                     }
+                    // A failure report counts only from the worker that holds the event now (or when nobody does:
+                    // its delivery timed out). A late one from an earlier holder would cancel the current delivery.
+                    {
+                        let core = self.core.lock().unwrap();
+                        r.items.retain(|it| {
+                            if it.ok {
+                                return true;
+                            }
+                            let stale = core.groups.get(&it.group).and_then(|st| st.inflight.get(&it.source)).is_some_and(|f| f.seq != it.seq || f.worker != it.worker_id);
+                            if stale {
+                                self.stats.stale_failures.fetch_add(1, Relaxed);
+                            }
+                            !stale
+                        });
+                    }
                     if !r.items.is_empty() {
                         let _ = res_tx.try_send(PendingResults { reply_to: r.reply_to, items: r.items });
                     }
@@ -647,7 +673,7 @@ impl<B: Backend> Dispatcher<B> {
                     let sources: HashSet<&String> = p.sources.iter().collect();
                     for st in core.groups.values_mut() {
                         for (s, f) in st.inflight.iter_mut() {
-                            if sources.contains(s) {
+                            if f.worker == p.worker_id && sources.contains(s) {
                                 f.deadline = deadline;
                             }
                         }
@@ -899,7 +925,7 @@ impl<B: Backend> Dispatcher<B> {
         self.stats.commit_batches.fetch_add(1, Relaxed);
         let mut k = 0;
         // (group, source, seq, outcome known, for "done" removals: the source's next event) released from in-flight
-        let mut done: Vec<(String, String, i64, bool, Option<Option<Head>>, bool)> = vec![];
+        let mut done: Vec<(String, String, i64, bool, Option<Option<Head>>, bool, String)> = vec![];
         let mut result_acks: HashMap<String, Vec<v1::ResultAck>> = HashMap::new();
         for b in batch {
             let mut acks = vec![];
@@ -964,7 +990,7 @@ impl<B: Backend> Dispatcher<B> {
                 // Release it either way: on an error nothing changed in Octopus's tables, so offer it again now (flagged:
                 // a "done" worker has committed its own writes already).
                 let known = status != v1::ResultStatus::ResultError && status != v1::ResultStatus::ResultGap;
-                done.push((r.group.clone(), r.source.clone(), r.seq, known || !r.done, next, r.ok));
+                done.push((r.group.clone(), r.source.clone(), r.seq, known || !r.done, next, r.ok, r.worker_id.clone()));
                 acks.push(v1::ResultAck { request_id: r.request_id, status: status as i32 });
             }
             if !b.reply_to.is_empty() {
@@ -978,10 +1004,14 @@ impl<B: Backend> Dispatcher<B> {
         self.send_batched(replies).await;
         {
             let mut core = self.core.lock().unwrap();
-            for (g, s, q, outcome_known, next, ok) in done {
+            for (g, s, q, outcome_known, next, ok, w) in done {
                 if let Some(st) = core.groups.get_mut(&g) {
-                    if st.inflight.get(&s).is_some_and(|f| f.seq == q) {
+                    if st.inflight.get(&s).is_some_and(|f| f.seq == q && (ok || f.worker == w)) {
                         st.inflight.remove(&s);
+                    } else if !ok && st.inflight.contains_key(&s) {
+                        // handed out again meanwhile: that delivery stands
+                        self.stats.stale_failures.fetch_add(1, Relaxed);
+                        continue;
                     }
                     if outcome_known {
                         st.suspect.remove(&(s.clone(), q));
@@ -1219,6 +1249,13 @@ impl<B: Backend> Dispatcher<B> {
                 for st in core.groups.values_mut() {
                     let before = st.inflight.len();
                     let GroupState { inflight, suspect, .. } = st;
+                    for (s, f) in inflight.iter_mut() {
+                        let age = now.duration_since(f.since);
+                        if !f.warned && age >= LONG_OUTSTANDING {
+                            f.warned = true;
+                            warn!(source = %s, seq = f.seq, worker = %f.worker, age_s = age.as_secs(), "delivery outstanding for long (the worker reports progress)");
+                        }
+                    }
                     inflight.retain(|s, f| {
                         let keep = f.deadline > now;
                         if !keep {
@@ -1392,7 +1429,7 @@ impl<B: Backend> Dispatcher<B> {
                 published = s.published.load(Relaxed), applied = s.applied.load(Relaxed),
                 completed_by_worker = s.completed_by_worker.load(Relaxed),
                 duplicates = s.duplicates.load(Relaxed), failures = s.failures.load(Relaxed),
-                timeouts = s.timeouts.load(Relaxed), commit_batches = s.commit_batches.load(Relaxed),
+                timeouts = s.timeouts.load(Relaxed), stale_failures = s.stale_failures.load(Relaxed), commit_batches = s.commit_batches.load(Relaxed),
                 fetches = s.fetches.load(Relaxed), "stats"
             );
         }
