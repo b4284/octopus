@@ -1,0 +1,15 @@
+[package]
+name = "octopus-fabric"
+version = "0.1.0"
+description = "Pub/sub transport for Octopus (MQTT 5 first; Solace speaks MQTT natively)"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+bytes.workspace = true
+rumqttc = "0.25.1"
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true

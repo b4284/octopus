@@ -1,0 +1,30 @@
+[package]
+name = "octopusd"
+version = "0.1.0"
+description = "Octopus dispatcher: leaderless, active-active, stateless; all durable state in SQL"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "octopusd"
+path = "src/main.rs"
+
+[dependencies]
+octopus-core.workspace = true
+octopus-pg = { path = "../octopus-pg" }
+octopus-proto = { path = "../octopus-proto" }
+octopus-fabric = { path = "../octopus-fabric" }
+bytes.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+xxhash-rust = { version = "0.8.21", features = ["xxh3"] }
+
+[dev-dependencies]
+octopus-client = { path = "../octopus-client" }
+tokio-postgres.workspace = true

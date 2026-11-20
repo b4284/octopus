@@ -1,0 +1,219 @@
+//! End to end: real `octopusd` processes, an MQTT broker, PostgreSQL, and in-process producers and workers.
+//! Needs Mosquitto on 127.0.0.1:1883 (`dev/up.sh`) and PostgreSQL (OCTOPUS_TEST_PG, see the octopus-pg tests).
+//! Each test uses its own database schema and topic namespace.
+
+use std::collections::HashMap;
+use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
+
+use bytes::Bytes;
+use octopus_client::{Delivery, Handler, Outcome, Producer, PublishItem, Worker, WorkerConfig};
+use octopus_fabric::MqttConfig;
+use tokio::sync::watch;
+
+fn pg() -> String {
+    std::env::var("OCTOPUS_TEST_PG")
+        .unwrap_or_else(|_| "host=127.0.0.1 port=5432 user=bench password=bench dbname=octopus_test".into())
+}
+
+static N: AtomicU64 = AtomicU64::new(0);
+
+fn uniq(tag: &str) -> String {
+    let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() % 100_000_000;
+    format!("{tag}_{t}_{}", N.fetch_add(1, Ordering::Relaxed))
+}
+
+const HOOKS: &str = r#"
+BEGIN;
+SELECT pg_advisory_xact_lock(hashtext('octopus.test.hooks'));
+CREATE SCHEMA IF NOT EXISTS octo_test;
+CREATE TABLE IF NOT EXISTS octo_test.applied (source text, seq bigint, effect bytea, PRIMARY KEY (source, seq));
+CREATE OR REPLACE FUNCTION octo_test.apply(p_src text[], p_seq bigint[], p_eff bytea[]) RETURNS void
+LANGUAGE plpgsql AS $$
+BEGIN
+  IF 'boom'::bytea = ANY(p_eff) THEN RAISE EXCEPTION 'apply hook failed on purpose'; END IF;
+  INSERT INTO octo_test.applied SELECT * FROM unnest(p_src, p_seq, p_eff);
+END $$;
+COMMIT;
+"#;
+
+async fn db() -> tokio_postgres::Client {
+    let (c, conn) = tokio_postgres::connect(&pg(), tokio_postgres::NoTls).await.expect("postgres");
+    tokio::spawn(conn);
+    c
+}
+
+struct Dispatcher(Child);
+
+impl Dispatcher {
+    fn start(ns: &str, member: &str) -> Self {
+        let child = Command::new(env!("CARGO_BIN_EXE_octopusd"))
+            .env("OCTOPUS_MEMBER_ID", member)
+            .env("OCTOPUS_NS", ns)
+            .env("OCTOPUS_SCHEMA", ns)
+            .env("OCTOPUS_PG", pg())
+            .env("OCTOPUS_APPLY_HOOK", "octo_test.apply")
+            .env("OCTOPUS_LEASE_TTL_MS", "1500")
+            .env("OCTOPUS_TICK_MS", "250")
+            .env("OCTOPUS_DELIVERY_TIMEOUT_MS", "3000")
+            .env("RUST_LOG", std::env::var("OCTOPUS_TEST_LOG").unwrap_or_else(|_| "warn".into()))
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .expect("start octopusd");
+        Dispatcher(child)
+    }
+
+    /// Like a crashed pod: no drain, no lease release, the connection just drops.
+    fn kill(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+
+    /// Planned stop (SIGTERM): drain, release the leases, leave.
+    fn terminate(&mut self) {
+        let _ = Command::new("kill").arg("-TERM").arg(self.0.id().to_string()).status();
+        let _ = self.0.wait();
+    }
+}
+
+impl Drop for Dispatcher {
+    fn drop(&mut self) {
+        self.kill();
+    }
+}
+
+/// Fails ~10% of attempts and is slow now and then.
+struct Flaky {
+    calls: AtomicU64,
+}
+
+impl Handler for Flaky {
+    async fn handle(&self, d: Delivery) -> Outcome {
+        let n = self.calls.fetch_add(1, Ordering::Relaxed);
+        let h = (n.wrapping_mul(0x9E3779B97F4A7C15) ^ d.seq as u64) % 100;
+        if h < 10 {
+            return Outcome::Retry(Duration::from_millis(20));
+        }
+        if h < 13 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        Outcome::Commit(Bytes::from(format!("{}:{}", d.source, d.seq)))
+    }
+}
+
+async fn start_workers(ns: &str, groups: &[String], n: usize, slots: u32) -> (Vec<tokio::task::JoinHandle<()>>, watch::Sender<bool>) {
+    let (stop_tx, stop_rx) = watch::channel(false);
+    let mut tasks = vec![];
+    for i in 0..n {
+        let id = format!("{ns}-w{i}");
+        let cfg = WorkerConfig::new(id.clone(), ns, groups.to_vec(), slots);
+        let (w, rx) = Worker::connect(MqttConfig::new("127.0.0.1", 1883, id), cfg, Flaky { calls: AtomicU64::new(i as u64) })
+            .await
+            .expect("worker");
+        tasks.push(tokio::spawn(w.run(rx, stop_rx.clone())));
+    }
+    (tasks, stop_tx)
+}
+
+/// Publishes `seqs` events for each source, each source in order, sources concurrently; every 7th event is
+/// published twice (a producer retry).
+async fn publish_all(ns: &str, groups: &[String], sources: &[String], seqs: i64) {
+    let producer = Producer::connect(MqttConfig::new("127.0.0.1", 1883, format!("{ns}-p")), ns, &format!("{ns}-p")).await.unwrap();
+    let mut tasks = vec![];
+    for (i, s) in sources.iter().enumerate() {
+        let (p, s, g) = (producer.clone(), s.clone(), groups[i % groups.len()].clone());
+        tasks.push(tokio::spawn(async move {
+            for q in 1..=seqs {
+                let item = PublishItem { group: g.clone(), source: s.clone(), seq: q, body: Bytes::from(format!("{s}/{q}")) };
+                p.publish(vec![item.clone()]).await.expect("publish");
+                if q % 7 == 0 {
+                    p.publish(vec![item]).await.expect("republish");
+                }
+            }
+        }));
+    }
+    for t in tasks {
+        t.await.unwrap();
+    }
+}
+
+/// Waits until every source has applied 1..=seqs, then checks each was applied exactly once, in order.
+async fn wait_all_applied(sources: &[String], seqs: i64, limit: Duration) {
+    let c = db().await;
+    let want = sources.len() as i64 * seqs;
+    let until = Instant::now() + limit;
+    loop {
+        let row = c.query_one("SELECT count(*) FROM octo_test.applied WHERE source = ANY($1)", &[&sources]).await.unwrap();
+        let n: i64 = row.get(0);
+        if n == want {
+            break;
+        }
+        assert!(Instant::now() < until, "only {n} of {want} events applied in {limit:?}");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    let rows = c.query("SELECT source, seq FROM octo_test.applied WHERE source = ANY($1) ORDER BY source, seq", &[&sources]).await.unwrap();
+    let mut per: HashMap<String, Vec<i64>> = HashMap::new();
+    for r in rows {
+        per.entry(r.get(0)).or_default().push(r.get(1));
+    }
+    for s in sources {
+        assert_eq!(per.get(s).cloned().unwrap_or_default(), (1..=seqs).collect::<Vec<_>>(), "source {s}");
+    }
+}
+
+async fn setup(ns: &str, groups: usize, sources: usize) -> (Vec<String>, Vec<String>) {
+    db().await.batch_execute(HOOKS).await.unwrap();
+    let groups: Vec<String> = (0..groups).map(|i| format!("g{i}")).collect();
+    let sources: Vec<String> = (0..sources).map(|i| format!("{ns}-s{i}")).collect();
+    (groups, sources)
+}
+
+async fn backlog(schema: &str) -> i64 {
+    let c = db().await;
+    let r = c
+        .query_one(&format!("SELECT count(*) FROM {schema}.event e JOIN {schema}.source s USING (source) WHERE e.seq > s.last_seq"), &[])
+        .await
+        .unwrap();
+    r.get(0)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn one_dispatcher_end_to_end() {
+    let ns = uniq("e2e");
+    let (groups, sources) = setup(&ns, 4, 40).await;
+    let _d = Dispatcher::start(&ns, "d1");
+    let (workers, stop) = start_workers(&ns, &groups, 2, 4).await;
+    publish_all(&ns, &groups, &sources, 25).await;
+    wait_all_applied(&sources, 25, Duration::from_secs(60)).await;
+    assert_eq!(backlog(&ns).await, 0);
+    let _ = stop.send(true);
+    for w in workers {
+        let _ = w.await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn three_dispatchers_survive_a_crash_and_a_planned_stop() {
+    let ns = uniq("e2e");
+    let (groups, sources) = setup(&ns, 12, 60).await;
+    let mut d1 = Dispatcher::start(&ns, "d1");
+    let mut d2 = Dispatcher::start(&ns, "d2");
+    let _d3 = Dispatcher::start(&ns, "d3");
+    let (workers, stop) = start_workers(&ns, &groups, 3, 4).await;
+    let killer = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        d1.kill(); // crash: its groups move when the leases expire
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        d2.terminate(); // planned: drains and hands over at once
+    });
+    publish_all(&ns, &groups, &sources, 60).await;
+    wait_all_applied(&sources, 60, Duration::from_secs(120)).await;
+    killer.await.unwrap();
+    assert_eq!(backlog(&ns).await, 0);
+    let _ = stop.send(true);
+    for w in workers {
+        let _ = w.await;
+    }
+}

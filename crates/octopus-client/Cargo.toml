@@ -1,0 +1,16 @@
+[package]
+name = "octopus-client"
+version = "0.1.0"
+description = "Octopus client: producers and workers"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+octopus-proto = { path = "../octopus-proto" }
+octopus-fabric = { path = "../octopus-fabric" }
+bytes.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true

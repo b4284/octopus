@@ -2,8 +2,12 @@
 
 **Ordered per-key event processing on a plain SQL database, with an active-active dispatcher cluster.**
 
-> Status: **design phase.** Nothing here is usable yet. The design is in [docs/design.md](docs/design.md); the
-> measurements behind it are in [docs/why.md](docs/why.md).
+> **Status: early implementation, not production-ready.**
+> - The design is in [docs/design.md](docs/design.md), the measurements behind it in [docs/why.md](docs/why.md), and
+>   the formal model in [spec/](spec/).
+> - Built so far: the Rust dispatcher (`octopusd`), the PostgreSQL backend, the MQTT 5 transport, and a Rust
+>   client for producers and workers.
+> - End-to-end tests pass with three dispatchers, one crashed (`kill -9`) and one stopped mid-run.
 
 Many systems need to process events **in order per source** (device, account, entity) while keeping thousands of
 sources moving in parallel. **A slow or failing event must hold back only its own source.** The state each event
@@ -50,6 +54,19 @@ sent after the SQL commit.
 ## Databases
 
 Postgres first, then SQL Server and MySQL behind a small backend interface.
+
+## Try it
+
+Needs Rust, `protoc`, PostgreSQL and podman (or docker).
+
+```
+dev/up.sh                                   # Mosquitto (MQTT 5) on 127.0.0.1:1883
+export OCTOPUS_TEST_PG="host=127.0.0.1 port=5432 user=... password=... dbname=octopus_test"
+cargo test                                  # backend tests + end-to-end tests with real octopusd processes
+```
+
+Run a dispatcher: `OCTOPUS_PG=... OCTOPUS_MEMBER_ID=d1 cargo run --release -p octopusd`. The settings are listed in
+`crates/octopusd/src/main.rs`.
 
 ## Licence
 

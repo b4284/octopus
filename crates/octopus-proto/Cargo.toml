@@ -1,0 +1,15 @@
+[package]
+name = "octopus-proto"
+version = "0.1.0"
+description = "Octopus wire protocol (Protobuf messages carried over a pub/sub fabric)"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+bytes.workspace = true
+prost = "0.14.6"
+
+[build-dependencies]
+prost-build = "0.14.6"

@@ -150,4 +150,7 @@ pub trait Backend: Send + Sync + 'static {
 
     /// Every unexpired lease, with its owner's address.
     fn leases(&self) -> impl Future<Output = Result<Vec<(Lease, String)>>> + Send;
+
+    /// Housekeeping: delete up to `limit` rows left at or below their cursor by a publish/commit race.
+    fn purge_applied(&self, limit: i32) -> impl Future<Output = Result<i64>> + Send;
 }

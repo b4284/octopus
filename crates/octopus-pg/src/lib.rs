@@ -21,8 +21,10 @@ pub struct PgConfig {
     /// A multi-host string with `target_session_attrs=read-write` follows a failover to the new primary.
     pub connection: String,
     pub pool_size: usize,
-    /// Create or update the `octopus` schema on connect.
+    /// Create or update the schema on connect.
     pub migrate: bool,
+    /// Database schema holding Octopus's tables (default `octopus`). Separate schemas isolate tenants or tests.
+    pub schema: String,
     /// Apply hook: `fn(sources text[], seqs bigint[], effects bytea[])`, called in the commit transaction with the
     /// events being applied. Writes the application's state.
     pub apply_hook: Option<String>,
@@ -33,12 +35,13 @@ pub struct PgConfig {
 
 impl PgConfig {
     pub fn new(connection: impl Into<String>) -> Self {
-        Self { connection: connection.into(), pool_size: 16, migrate: true, apply_hook: None, load_hook: None }
+        Self { connection: connection.into(), pool_size: 16, migrate: true, schema: "octopus".into(), apply_hook: None, load_hook: None }
     }
 }
 
 pub struct PgBackend {
     pool: Pool,
+    schema: String,
     apply_hook: Option<String>,
     load_sql: Option<String>,
 }
@@ -57,10 +60,14 @@ impl PgBackend {
         let mgr = Manager::from_config(pg, NoTls, ManagerConfig { recycling_method: RecyclingMethod::Fast });
         let pool = Pool::builder(mgr).max_size(cfg.pool_size).build().map_err(db)?;
         let client = pool.get().await.map_err(db)?;
+        if !cfg.schema.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_') || cfg.schema.is_empty() {
+            return Err(Error::Config(format!("schema name {:?}: use [a-z0-9_]", cfg.schema)));
+        }
+        let schema_sql = SCHEMA_SQL.replace("SCHEMA IF NOT EXISTS octopus;", &format!("SCHEMA IF NOT EXISTS {};", cfg.schema)).replace("octopus.", &format!("{}.", cfg.schema));
         if cfg.migrate {
             // One migrator at a time; the script itself is idempotent.
             client
-                .batch_execute(&format!("BEGIN; SELECT pg_advisory_xact_lock(hashtext('octopus.migrate')); {SCHEMA_SQL}; COMMIT;"))
+                .batch_execute(&format!("BEGIN; SELECT pg_advisory_xact_lock(hashtext('octopus-migrate')); {schema_sql}; COMMIT;"))
                 .await
                 .map_err(db)?;
         }
@@ -75,19 +82,18 @@ impl PgBackend {
                 }
             }
         }
-        Ok(Self { pool, apply_hook: cfg.apply_hook, load_sql })
+        Ok(Self { pool, schema: cfg.schema, apply_hook: cfg.apply_hook, load_sql })
+    }
+
+    /// Statement text with the configured schema.
+    fn q(&self, sql: &str) -> String {
+        sql.replace("octopus.", &format!("{}.", self.schema))
     }
 
     async fn client(&self) -> Result<deadpool_postgres::Object> {
         self.pool.get().await.map_err(db)
     }
 
-    /// Delete rows left at or below their cursor (see `octopus.purge_applied`). Run now and then.
-    pub async fn purge_applied(&self, limit: i32) -> Result<i64> {
-        let c = self.client().await?;
-        let row = c.query_one("SELECT octopus.purge_applied($1)", &[&limit]).await.map_err(db)?;
-        Ok(row.get(0))
-    }
 }
 
 impl Backend for PgBackend {
@@ -103,7 +109,7 @@ impl Backend for PgBackend {
             return Err(Error::Invalid("seq starts at 1".into()));
         }
         let c = self.client().await?;
-        let st = c.prepare_cached("SELECT octopus.publish($1, $2, $3, $4)").await.map_err(db)?;
+        let st = c.prepare_cached(&self.q("SELECT octopus.publish($1, $2, $3, $4)")).await.map_err(db)?;
         let row = c.query_one(&st, &[&grp, &src, &seq, &body]).await.map_err(db)?;
         let codes: Vec<i16> = row.get(0);
         Ok(codes
@@ -125,8 +131,7 @@ impl Backend for PgBackend {
         let exclude: Vec<&str> = requests.iter().flat_map(|r| r.exclude_sources.iter().map(String::as_str)).collect();
         let c = self.client().await?;
         let st = c
-            .prepare_cached(
-                "SELECT x.grp, x.source, x.seq, x.body, x.attempts, \
+            .prepare_cached(&self.q("SELECT x.grp, x.source, x.seq, x.body, x.attempts, \
                         (extract(epoch FROM x.enqueued_at) * 1000000)::bigint \
                    FROM unnest($1::text[], $2::int[]) AS g(name, n) CROSS JOIN LATERAL ( \
                         SELECT e.grp, e.source, e.seq, e.body, e.attempts, e.enqueued_at \
@@ -135,7 +140,7 @@ impl Backend for PgBackend {
                          WHERE s.grp = g.name AND s.source <> ALL($3::text[]) \
                            AND (e.not_before IS NULL OR e.not_before <= now()) \
                          ORDER BY e.enqueued_at, e.source \
-                         LIMIT g.n) x",
+                         LIMIT g.n) x"),
             )
             .await
             .map_err(db)?;
@@ -180,7 +185,7 @@ impl Backend for PgBackend {
         let seq: Vec<i64> = commits.iter().map(|c| c.key.seq).collect();
         let eff: Vec<&[u8]> = commits.iter().map(|c| c.effect.as_ref()).collect();
         let c = self.client().await?;
-        let st = c.prepare_cached("SELECT octopus.commit_many($1, $2, $3, $4)").await.map_err(db)?;
+        let st = c.prepare_cached(&self.q("SELECT octopus.commit_many($1, $2, $3, $4)")).await.map_err(db)?;
         let row = c.query_one(&st, &[&src, &seq, &eff, &self.apply_hook]).await.map_err(db)?;
         let codes: Vec<i16> = row.get(0);
         Ok(codes
@@ -196,9 +201,8 @@ impl Backend for PgBackend {
     async fn fail(&self, key: &EventKey, delay: Duration) -> Result<()> {
         let c = self.client().await?;
         let st = c
-            .prepare_cached(
-                "UPDATE octopus.event SET attempts = attempts + 1, not_before = now() + $3::text::interval \
-                  WHERE source = $1 AND seq = $2",
+            .prepare_cached(&self.q("UPDATE octopus.event SET attempts = attempts + 1, not_before = now() + $3::text::interval \
+                  WHERE source = $1 AND seq = $2"),
             )
             .await
             .map_err(db)?;
@@ -208,15 +212,14 @@ impl Backend for PgBackend {
 
     async fn groups(&self) -> Result<Vec<String>> {
         let c = self.client().await?;
-        let rows = c.query("SELECT name FROM octopus.grp ORDER BY name", &[]).await.map_err(db)?;
+        let rows = c.query(&self.q("SELECT name FROM octopus.grp ORDER BY name"), &[]).await.map_err(db)?;
         Ok(rows.into_iter().map(|r| r.get(0)).collect())
     }
 
     async fn backlog(&self) -> Result<i64> {
         let c = self.client().await?;
         let row = c
-            .query_one(
-                "SELECT count(*) FROM octopus.event e JOIN octopus.source s ON s.source = e.source WHERE e.seq > s.last_seq",
+            .query_one(&self.q("SELECT count(*) FROM octopus.event e JOIN octopus.source s ON s.source = e.source WHERE e.seq > s.last_seq"),
                 &[],
             )
             .await
@@ -226,16 +229,14 @@ impl Backend for PgBackend {
 
     async fn heartbeat(&self, member: &Member, ttl: Duration) -> Result<Vec<Member>> {
         let c = self.client().await?;
-        c.execute(
-            "INSERT INTO octopus.member (member_id, address, heartbeat) VALUES ($1, $2, now()) \
-             ON CONFLICT (member_id) DO UPDATE SET address = excluded.address, heartbeat = excluded.heartbeat",
+        c.execute(&self.q("INSERT INTO octopus.member (member_id, address, heartbeat) VALUES ($1, $2, now()) \
+             ON CONFLICT (member_id) DO UPDATE SET address = excluded.address, heartbeat = excluded.heartbeat"),
             &[&member.id, &member.address],
         )
         .await
         .map_err(db)?;
         let rows = c
-            .query(
-                "SELECT member_id, address FROM octopus.member WHERE heartbeat > now() - $1::text::interval ORDER BY member_id",
+            .query(&self.q("SELECT member_id, address FROM octopus.member WHERE heartbeat > now() - $1::text::interval ORDER BY member_id"),
                 &[&interval(ttl)],
             )
             .await
@@ -246,9 +247,8 @@ impl Backend for PgBackend {
     async fn renew(&self, member: &str, groups: &[String], ttl: Duration) -> Result<Vec<String>> {
         let c = self.client().await?;
         let rows = c
-            .query(
-                "UPDATE octopus.lease SET expires_at = now() + $3::text::interval \
-                  WHERE owner = $1 AND grp = ANY($2) RETURNING grp",
+            .query(&self.q("UPDATE octopus.lease SET expires_at = now() + $3::text::interval \
+                  WHERE owner = $1 AND grp = ANY($2) RETURNING grp"),
                 &[&member, &groups, &interval(ttl)],
             )
             .await
@@ -262,12 +262,11 @@ impl Backend for PgBackend {
         }
         let c = self.client().await?;
         let rows = c
-            .query(
-                "INSERT INTO octopus.lease AS l (grp, owner, epoch, expires_at) \
+            .query(&self.q("INSERT INTO octopus.lease AS l (grp, owner, epoch, expires_at) \
                  SELECT g, $1, 1, now() + $3::text::interval FROM unnest($2::text[]) AS g ORDER BY g \
                  ON CONFLICT (grp) DO UPDATE SET owner = excluded.owner, epoch = l.epoch + 1, expires_at = excluded.expires_at \
                  WHERE l.expires_at < now() OR l.owner = excluded.owner \
-                 RETURNING grp, owner, epoch",
+                 RETURNING grp, owner, epoch"),
                 &[&member, &groups, &interval(ttl)],
             )
             .await
@@ -277,7 +276,7 @@ impl Backend for PgBackend {
 
     async fn release(&self, member: &str, groups: &[String]) -> Result<()> {
         let c = self.client().await?;
-        c.execute("DELETE FROM octopus.lease WHERE owner = $1 AND grp = ANY($2)", &[&member, &groups])
+        c.execute(&self.q("DELETE FROM octopus.lease WHERE owner = $1 AND grp = ANY($2)"), &[&member, &groups])
             .await
             .map_err(db)?;
         Ok(())
@@ -285,17 +284,22 @@ impl Backend for PgBackend {
 
     async fn leave(&self, member: &str) -> Result<()> {
         let c = self.client().await?;
-        c.execute("DELETE FROM octopus.lease WHERE owner = $1", &[&member]).await.map_err(db)?;
-        c.execute("DELETE FROM octopus.member WHERE member_id = $1", &[&member]).await.map_err(db)?;
+        c.execute(&self.q("DELETE FROM octopus.lease WHERE owner = $1"), &[&member]).await.map_err(db)?;
+        c.execute(&self.q("DELETE FROM octopus.member WHERE member_id = $1"), &[&member]).await.map_err(db)?;
         Ok(())
+    }
+
+    async fn purge_applied(&self, limit: i32) -> Result<i64> {
+        let c = self.client().await?;
+        let row = c.query_one(&self.q("SELECT octopus.purge_applied($1)"), &[&limit]).await.map_err(db)?;
+        Ok(row.get(0))
     }
 
     async fn leases(&self) -> Result<Vec<(Lease, String)>> {
         let c = self.client().await?;
         let rows = c
-            .query(
-                "SELECT l.grp, l.owner, l.epoch, m.address FROM octopus.lease l \
-                 JOIN octopus.member m ON m.member_id = l.owner WHERE l.expires_at > now() ORDER BY l.grp",
+            .query(&self.q("SELECT l.grp, l.owner, l.epoch, m.address FROM octopus.lease l \
+                 JOIN octopus.member m ON m.member_id = l.owner WHERE l.expires_at > now() ORDER BY l.grp"),
                 &[],
             )
             .await
