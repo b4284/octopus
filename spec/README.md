@@ -30,6 +30,7 @@ matter only for liveness and efficiency.
 |---|---|---|
 | `Safety2.cfg` | 2 sources × 2 seqs, 2 dispatchers, 1 worker, sync standby, `MaxNet = 2` | **passes**: exhaustive, 71.4M distinct states, depth 51, 15 min |
 | `Safety.cfg` | 1 source × 3 seqs, 2 dispatchers, 2 workers, sync standby, `MaxNet = 2` | no violation in 171.8M distinct states (depth 42), but **not complete** after 45 min; needs a longer run |
+| `SafetySim.cfg` | `Safety.cfg` with `MaxNet = 3`, **random simulation** (`-simulate -depth 200`) | no violation in 3.04 billion states on random paths up to 200 steps (20 min). Finds bugs; proves nothing. |
 | `SafetyAsync.cfg` | 1 source × 2 seqs, async standby | **violation, as expected**: an acknowledged publish is lost after failover (6 steps) |
 | `Liveness1.cfg` | 1 source × 2 seqs, 1 dispatcher, 1 worker, sync standby, `MaxNet = 2` | **`Progress` holds**: complete graph, 7.8k distinct states, 6.5 min |
 | `Liveness.cfg` | the same with 2 dispatchers | not finished in 30 min (liveness checking is mostly single-threaded) |
