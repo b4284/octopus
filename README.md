@@ -1,0 +1,56 @@
+# Octopus
+
+**Ordered per-key event processing on a plain SQL database, with an active-active dispatcher cluster.**
+
+> Status: **design phase.** Nothing here is usable yet. The design is in [docs/design.md](docs/design.md); the
+> measurements behind it are in [docs/why.md](docs/why.md).
+
+Many systems need to process events **in order per source** (device, account, entity) while keeping thousands of
+sources moving in parallel. **A slow or failing event must hold back only its own source.** The state each event
+changes should live in an ordinary SQL database, where it is easy to query and operate.
+
+Message brokers order by partition or queue, so one slow event blocks every source behind it. SQL-backed job
+queues keep the data in SQL, but they spend the database on polling and per-message bookkeeping.
+
+Octopus puts a small, stateless, leaderless dispatcher cluster in front of the database:
+
+```
+ producers ──publish──▶ ┌─────────────────────────────┐ ──deliver──▶ workers
+   (any instance)       │ octopus dispatchers (N pods)│ ◀──commit───
+                        │ no leader, any pod does any │
+                        │ work; leases split groups   │
+                        └──────────────┬──────────────┘
+                                       │ few connections, large batched transactions
+                        ┌──────────────▼──────────────┐
+                        │ SQL primary  ──sync──▶ DR    │
+                        └─────────────────────────────┘
+```
+
+## Guarantees
+
+- **Zero loss.** A publish is acknowledged only after it is committed to the database and to a synchronous
+  replica in another data center.
+- **Strict per-source order and exactly-once effect.** Each commit checks the source's cursor
+  (`seq = last + 1`), applies the state change and removes the queue row in **one transaction**. A
+  dispatcher's memory, a lease or a clock never decides correctness. A failed dispatcher can only cause a
+  duplicate *delivery*, which the database turns into "already applied".
+- **No cross-source blocking.** Work goes only into free worker slots. A failing event is retried for ever with
+  backoff and an alert, and holds back only its own source.
+- **Active-active and elastic.** Any dispatcher accepts any publish or commit. Group ownership is spread by
+  rendezvous hashing over database leases, with no leader. Scaling means adding pods; a lost pod's groups move
+  within one lease TTL.
+- **At-least-once execution.** Workers get `(source_id, seq)` as an idempotency key for any external call.
+
+## Transport
+
+Pluggable pub/sub. **MQTT 5** comes first: Solace PubSub+ supports it natively, and Mosquitto or EMQX run it in a
+container for tests. The fabric is never the durability point: every acknowledgement is an application reply
+sent after the SQL commit.
+
+## Databases
+
+Postgres first, then SQL Server and MySQL behind a small backend interface.
+
+## Licence
+
+GPL-3.0. See [LICENSE](LICENSE).
