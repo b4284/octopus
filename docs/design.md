@@ -219,6 +219,14 @@ buffers without limit and never drops.
 - **Crash.** The leases expire after one TTL (target 2–3 s), and the other instances claim the groups. Publishes
   are not affected, because any instance accepts them.
 
+### 5.4 Requirements found by the formal model (`spec/`)
+
+- **Delivery timeout.** If a handed-out event gets no commit, skip or fail within T, it is offered again. Workers
+  running long events send progress messages to extend T. Without the timeout, one lost message on a
+  non-persistent fabric strands its source.
+- **Guarded deletes.** "Already applied" deletes only rows with `seq <= cursor`. Publishes insert only rows with
+  `seq > cursor`, and the unique key absorbs retries.
+
 ## 6. Failure walk-through
 
 | event | what happens | loss? |
@@ -315,8 +323,14 @@ The EventBench benchmark harness tests Octopus through an adapter, like any othe
 
 1. **Protocol model.** TLA+ model of publish, leases, hand-over and commit. Model-check G2–G5, including a
    paused instance and lost messages.
-2. **Tooling.** An MQTT 5 broker container (Mosquitto; EMQX for a clustered fabric) and the Solace PubSub+
-   Standard container. The .NET MQTT client is MQTTnet. Dispatchers run as containers, like pods.
+2. **Tooling.** The dispatcher is written in **Rust** (owner, 2026-11-20):
+   - Tokio, with `tokio-postgres` or `sqlx`;
+   - `rumqttc` for MQTT 5;
+   - `prost` for Protobuf.
+
+   Client SDKs speak the Protobuf-over-MQTT protocol: Rust first, plus a thin .NET client that the EventBench
+   adapter uses. Test fabric: Mosquitto (EMQX for a clustered fabric) and the Solace PubSub+ Standard
+   container. Dispatchers run as containers, like pods.
 3. **Core.** The backend interface and its Postgres implementation:
    - seq-based heads;
    - guarded idempotent publish;
