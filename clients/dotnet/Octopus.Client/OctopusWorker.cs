@@ -16,8 +16,10 @@ public sealed class OctopusDelivery
 }
 
 /// <summary>
-/// Receives work for some groups. The application takes deliveries from <see cref="Deliveries"/>, reports each one
-/// with <see cref="CompleteAsync"/> or <see cref="Fail"/>, and frees its slot with <see cref="Done"/>.
+/// Receives work for some groups. The application takes deliveries from <see cref="Deliveries"/>, does its work and
+/// commits its own writes, then reports each one with <see cref="ReportDone"/> (or <see cref="Fail"/>), and frees its
+/// slot with <see cref="Release"/>. A delivery with <c>Item.PossiblyRedelivered</c> may already have been committed by
+/// an earlier attempt: check the idempotency key (Item.Source, Item.Seq) in your own data.
 /// Credits are granted to the owning dispatchers from free slots only, so no event waits inside a busy worker.
 /// A result returns its slot's credit to the dispatcher that receives it, so a busy worker sends no separate
 /// credit messages. Many workers can share one <see cref="OctopusConnection"/> (and its inbox).
@@ -85,6 +87,16 @@ public sealed class OctopusWorker : IAsyncDisposable
         finally { _conn.PendingResults.TryRemove(r.RequestId, out _); }
     }
 
+    /// <summary>
+    /// The worker has committed its own writes for this event: Octopus removes it so it is never handed out again.
+    /// Fire and forget (a lost report only means a repeat, flagged PossiblyRedelivered, after the delivery timeout).
+    /// </summary>
+    public void ReportDone(OctopusDelivery d)
+    {
+        var r = new WorkResult { RequestId = _conn.NextRequestId(), Group = d.Item.Group, Source = d.Item.Source, Seq = d.Item.Seq, Ok = true, Done = true, WorkerId = _id };
+        SendResult(d, r);
+    }
+
     /// <summary>The event failed: offer it again after <paramref name="retryDelay"/>.</summary>
     public Task Fail(OctopusDelivery d, TimeSpan retryDelay, CancellationToken ct = default)
     {
@@ -114,11 +126,42 @@ public sealed class OctopusWorker : IAsyncDisposable
     }
 
     /// <summary>The application is done with the delivery: its slot is free again.</summary>
-    public void Done(OctopusDelivery d)
+    public void Release(OctopusDelivery d)
     {
         if (Interlocked.Exchange(ref d.Done, 1) == 1) return;
         _running.TryRemove(new KeyValuePair<string, OctopusDelivery>(d.Item.Source, d));
         Rebalance();
+    }
+
+    /// <summary>
+    /// A dispatcher has ready events for one of our groups but none of our credit: give it our free slots, or move
+    /// credit from owners that hold it idle (they are told the reduced amount).
+    /// </summary>
+    internal void OnDemand(Demand d)
+    {
+        if (!_groups.Contains(d.Group) || !_conn.Members.ContainsKey(d.MemberId)) return;
+        var sends = new List<(string Member, int Credit, bool Reset)>();
+        lock (_gate)
+        {
+            int want = (int)Math.Max(1, d.Ready);
+            int give = Math.Min(want, Math.Max(0, _slots - _running.Count - _granted.Values.Sum()));
+            want -= give;
+            foreach (var o in _granted.Keys.Where(m => m != d.MemberId && _granted[m] > 0).ToList())
+            {
+                if (want == 0) break;
+                int take = Math.Min(_granted[o], want);
+                _granted[o] -= take;
+                want -= take;
+                give += take;
+                sends.Add((o, _granted[o], true));
+            }
+            if (give > 0)
+            {
+                _granted[d.MemberId] = _granted.GetValueOrDefault(d.MemberId) + give;
+                sends.Add((d.MemberId, give, false));
+            }
+        }
+        foreach (var (m, n, reset) in sends) SendCredit(m, n, reset);
     }
 
     private void OnTopologyChanged()

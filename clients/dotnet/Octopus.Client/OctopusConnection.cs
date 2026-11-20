@@ -271,6 +271,10 @@ public sealed class OctopusConnection : IAsyncDisposable
                 foreach (var a in env.ResultReply.Items)
                     if (PendingResults.TryRemove(a.RequestId, out var r)) r.TrySetResult(a.Status);
                 break;
+            case Envelope.BodyOneofCase.Demand:
+                foreach (var id in env.Demand.WorkerIds)
+                    if (Workers.TryGetValue(id, out var dw)) dw.OnDemand(env.Demand);
+                break;
             case Envelope.BodyOneofCase.Deliver:
                 var d = env.Deliver;
                 foreach (var item in d.Items)
