@@ -197,21 +197,26 @@ Next ==
     \/ \E w \in Workers : CrashWorker(w)
     \/ Replicate \/ Failover
 
-(* Liveness assumptions. Producers keep retrying unacknowledged events. Every message that keeps being sent
-   is eventually received (the fabric loses messages, but not all of them for ever). Dispatchers keep
-   handing out heads with fresh snapshots, workers eventually succeed, and timeouts fire.
-   Crashes, losses and failovers have no fairness: they may happen at any time. *)
+(* Liveness assumptions, per event. Producers keep retrying unacknowledged events. Each kind of message
+   about an event that keeps being sent is eventually received (the fabric loses messages, but not all of
+   them for ever). Dispatchers keep handing out heads with fresh snapshots, workers eventually succeed, and
+   timeouts fire. Crashes, losses and failovers have no fairness: they may happen at any time. *)
 Fairness ==
-    /\ \A e \in Events : WF_vars(Publish(e))
-    /\ \A m \in Msg : SF_vars(Accept(m)) /\ SF_vars(PubAck(m))
-    /\ \A m \in Msg, w \in Workers : SF_vars(Receive(w, m))
-    /\ \A m \in Msg, d \in Dispatchers : SF_vars(CommitTx(d, m)) /\ SF_vars(SkipTx(d, m)) /\ SF_vars(FailMsg(d, m))
-    /\ \A e \in Events : SF_vars(\E d \in Dispatchers, w \in Workers :
-                                  /\ Seq(e) = db.cursor[Src(e)] + 1
-                                  /\ Deliver(d, e, w, db.cursor[Src(e)]))
-    /\ \A w \in Workers, e \in Events, c \in 0..MaxSeq :
-           SF_vars(\E to \in Dispatchers : Finish(w, [e |-> e, ctx |-> c], to, TRUE))
-    /\ \A d \in Dispatchers, e \in Events : WF_vars(Timeout(d, e))
+    \A e \in Events :
+        /\ WF_vars(Publish(e))
+        /\ SF_vars(\E m \in net : m.e = e /\ Accept(m))
+        /\ SF_vars(\E m \in net : m.e = e /\ PubAck(m))
+        \* the fresh hand-out of the head (stale copies exist only to stress safety) eventually arrives
+        /\ SF_vars(\E m \in net, w \in Workers : m.type = "deliver" /\ m.e = e /\ m.ctx = Seq(e) - 1 /\ Receive(w, m))
+        /\ SF_vars(\E m \in net, d \in Dispatchers : m.e = e /\ CommitTx(d, m))
+        /\ SF_vars(\E m \in net, d \in Dispatchers : m.e = e /\ SkipTx(d, m))
+        /\ SF_vars(\E m \in net, d \in Dispatchers : m.e = e /\ FailMsg(d, m))
+        /\ SF_vars(\E d \in Dispatchers, w \in Workers :
+                        /\ Seq(e) = db.cursor[Src(e)] + 1
+                        /\ Deliver(d, e, w, db.cursor[Src(e)]))
+        \* a worker holding the head with a fresh snapshot eventually succeeds (no poison events)
+        /\ SF_vars(\E w \in Workers, to \in Dispatchers : Finish(w, [e |-> e, ctx |-> Seq(e) - 1], to, TRUE))
+        /\ WF_vars(\E d \in Dispatchers : Timeout(d, e))
 
 Spec == Init /\ [][Next]_vars /\ Fairness
 
@@ -231,6 +236,7 @@ NoStaleRows == \A e \in db.queue : Seq(e) > db.cursor[Src(e)]
 Safety == ExactlyOnce /\ AppliedIsPrefix /\ NoLoss /\ NoStaleRows
 
 (* G5: once every seq up to q of a source has been acknowledged, the source eventually reaches q. *)
-Progress == \A s \in Sources, q \in Seqs :
-                (\A r \in 1..q : <<s, r>> \in acked) ~> (db.cursor[s] >= q)
+AllAcked(s, q) == \A r \in 1..q : <<s, r>> \in acked
+
+Progress == \A s \in Sources : \A q \in Seqs : AllAcked(s, q) ~> (db.cursor[s] >= q)
 =============================================================================

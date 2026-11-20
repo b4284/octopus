@@ -8,4 +8,5 @@ Symmetry == Permutations(Dispatchers) \cup Permutations(Workers) \cup Permutatio
 
 (* Bounded model checking: every interleaving with at most MaxNet messages in transit at once. *)
 NetBound == Cardinality(net) <= MaxNet
+
 =====================================================================

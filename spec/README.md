@@ -26,12 +26,13 @@ matter only for liveness and efficiency.
 
 ## Configurations
 
-| config | instance | expected |
+| config | instance | result (2026-11-20, TLC 2.19, 8 cores) |
 |---|---|---|
-| `Safety.cfg` | 1 source × 3 seqs, 2 dispatchers, 2 workers, synchronous standby | no violation |
-| `Safety2.cfg` | 2 sources × 2 seqs, 2 dispatchers, 1 worker, synchronous standby | no violation. **Checked 2026-11-20 with `MaxNet = 2`: 71.4M distinct states, depth 51, 15 min on 8 cores, no error.** |
-| `SafetyAsync.cfg` | 1 source × 2 seqs, async standby | **violation**: an acknowledged publish lost after failover (found in 6 steps) |
-| `Liveness.cfg` | 1 source × 2 seqs, 2 dispatchers, synchronous standby | `Progress` holds under the fairness assumptions |
+| `Safety2.cfg` | 2 sources × 2 seqs, 2 dispatchers, 1 worker, sync standby, `MaxNet = 2` | **passes**: exhaustive, 71.4M distinct states, depth 51, 15 min |
+| `Safety.cfg` | 1 source × 3 seqs, 2 dispatchers, 2 workers, sync standby, `MaxNet = 2` | no violation in 171.8M distinct states (depth 42), but **not complete** after 45 min; needs a longer run |
+| `SafetyAsync.cfg` | 1 source × 2 seqs, async standby | **violation, as expected**: an acknowledged publish is lost after failover (6 steps) |
+| `Liveness1.cfg` | 1 source × 2 seqs, 1 dispatcher, 1 worker, sync standby, `MaxNet = 2` | **`Progress` holds**: complete graph, 7.8k distinct states, 6.5 min |
+| `Liveness.cfg` | the same with 2 dispatchers | not finished in 30 min (liveness checking is mostly single-threaded) |
 
 `MC.tla` adds **symmetry** (dispatchers, workers and sources are interchangeable) and a **bound on messages in
 transit at once** (`MaxNet`). The checks are therefore exhaustive up to that bound: bounded model checking. Without
@@ -45,6 +46,15 @@ the bound, the 2-source instance passed 170M distinct states without finishing.
    the database can only happen after a lossy (async) failover; the guard keeps it harmless anyway.
 3. **Insert guarded by the cursor** (`seq > cursor`) plus a unique key: a producer retry after the event was
    applied leaves nothing behind.
+
+## Fairness: two lessons from TLC
+
+The first liveness runs failed for modelling reasons, not protocol reasons:
+1. **Fairness per message** (about 200 strong-fairness conditions) makes TLC reject the property as a tautology
+   (`satisfiability problem has 0 branches`). Fairness is now stated **per event**.
+2. **Fairness must target the fresh path.** "Some delivery of the event is received" or "some worker succeeds" is
+   too weak: TLC found loops where only *stale* copies got through, and each copy correctly failed. Real
+   dispatchers hand out only fresh heads; the stale copies exist in the model only to stress safety.
 
 ## Not modelled yet
 
