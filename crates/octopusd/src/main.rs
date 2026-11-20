@@ -55,6 +55,8 @@ async fn main() {
     pg.schema = env("OCTOPUS_SCHEMA", "octopus");
     pg.apply_hook = std::env::var("OCTOPUS_APPLY_HOOK").ok().filter(|s| !s.is_empty());
     pg.load_hook = std::env::var("OCTOPUS_LOAD_HOOK").ok().filter(|s| !s.is_empty());
+    // known heads are handed out straight away unless contexts must be preloaded for them
+    cfg.fast_path = pg.load_hook.is_none();
     let backend = loop {
         match PgBackend::connect(pg.clone()).await {
             Ok(b) => break b,

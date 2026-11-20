@@ -43,6 +43,9 @@ pub struct Config {
     pub fetch_max_groups: usize,
     pub purge_every: Duration,
     pub stats_every: Duration,
+    /// Hand out events known to be heads (from publishes and "done" removals) without reading the group's heads.
+    /// Off when contexts are preloaded by a load hook (the fast path has no context).
+    pub fast_path: bool,
 }
 
 impl Config {
@@ -64,6 +67,7 @@ impl Config {
             fetch_max_groups: 64,
             purge_every: Duration::from_secs(30),
             stats_every: Duration::from_secs(5),
+            fast_path: true,
         }
     }
 }
@@ -98,6 +102,59 @@ struct GroupState {
     /// Events stored before this instant (Unix µs, with slack) may have been handed out by the previous owner.
     claimed_us: i64,
     last_demand: Option<Instant>,
+    /// source -> last seq known removed by this owner (stale hints are ignored)
+    cursor: HashMap<String, i64>,
+    /// source -> highest seq known stored
+    known_max: HashMap<String, i64>,
+}
+
+/// Largest head body carried in a hint (bigger ones are read from the database by the owner).
+const HINT_BODY_MAX: usize = 64 * 1024;
+
+impl GroupState {
+    /// Queue a known head for hand-out unless it is stale or its source already has an event out or queued.
+    fn offer(&mut self, head: Head) -> bool {
+        let s = &head.key.source;
+        if !self.serving
+            || self.inflight.contains_key(s)
+            || self.cursor.get(s).is_some_and(|c| *c >= head.key.seq)
+            || self.ready.iter().any(|r| r.head.key.source == *s)
+        {
+            return false;
+        }
+        self.ready.push_back(ReadyHead { head, context: None });
+        true
+    }
+
+    /// Events stored for this group (by this dispatcher or, via a hint, another one).
+    fn stored(&mut self, group: &str, events: Vec<v1::HintEvent>, fast_path: bool) {
+        for e in events {
+            let m = self.known_max.entry(e.source.clone()).or_insert(0);
+            *m = (*m).max(e.seq);
+            if !fast_path {
+                self.dirty = true;
+                continue;
+            }
+            if e.head {
+                match e.body {
+                    Some(body) => {
+                        let head = Head {
+                            group: group.to_owned(),
+                            key: EventKey { source: e.source, seq: e.seq },
+                            body,
+                            attempts: 0,
+                            enqueued_at_us: e.enqueued_us,
+                        };
+                        self.offer(head);
+                    }
+                    None => self.dirty = true,
+                }
+            } else if self.cursor.get(&e.source) == Some(&(e.seq - 1)) && !self.inflight.contains_key(&e.source) {
+                // stored while its predecessor was being removed: it is the head now
+                self.dirty = true;
+            }
+        }
+    }
 }
 
 struct WorkerState {
@@ -445,6 +502,15 @@ impl<B: Backend> Dispatcher<B> {
                             st.dirty = true;
                         }
                     }
+                    let mut per_group: HashMap<String, Vec<v1::HintEvent>> = HashMap::new();
+                    for e in h.events {
+                        per_group.entry(e.group.clone()).or_default().push(e);
+                    }
+                    for (g, events) in per_group {
+                        if let Some(st) = core.groups.get_mut(&g) {
+                            st.stored(&g, events, self.cfg.fast_path);
+                        }
+                    }
                     drop(core);
                     self.wake.notify_one();
                 }
@@ -546,7 +612,7 @@ impl<B: Backend> Dispatcher<B> {
         }
         let result = self.backend.publish(&events).await;
         self.stats.publish_batches.fetch_add(1, Relaxed);
-        let mut touched: HashSet<String> = HashSet::new();
+        let mut stored: HashMap<String, Vec<v1::HintEvent>> = HashMap::new();
         let mut replies: HashMap<String, Vec<v1::Envelope>> = HashMap::new();
         let mut k = 0;
         for (i, p) in batch.into_iter().enumerate() {
@@ -561,8 +627,17 @@ impl<B: Backend> Dispatcher<B> {
                             .iter()
                             .zip(&p.items)
                             .map(|(o, it)| match o {
-                                PublishOutcome::Stored => {
-                                    touched.insert(it.group.clone());
+                                PublishOutcome::Stored | PublishOutcome::StoredHead => {
+                                    let head = *o == PublishOutcome::StoredHead;
+                                    let body = (head && it.body.len() <= HINT_BODY_MAX).then(|| it.body.clone());
+                                    stored.entry(it.group.clone()).or_default().push(v1::HintEvent {
+                                        group: it.group.clone(),
+                                        source: it.source.clone(),
+                                        seq: it.seq,
+                                        head,
+                                        body,
+                                        enqueued_us: now_us(),
+                                    });
                                     self.stats.published.fetch_add(1, Relaxed);
                                     v1::PublishStatus::PublishStored as i32
                                 }
@@ -587,24 +662,24 @@ impl<B: Backend> Dispatcher<B> {
             warn!(error = %e, "publish batch failed");
             return;
         }
-        // Wake the owners: ourselves directly, the others with a hint.
-        let mut hints: HashMap<String, Vec<String>> = HashMap::new();
+        // Tell the owners: ourselves directly, the others with a hint carrying the events.
+        let mut hints: HashMap<String, Vec<v1::HintEvent>> = HashMap::new();
         {
             let mut core = self.core.lock().unwrap();
-            for g in touched {
+            for (g, events) in stored {
                 if let Some(st) = core.groups.get_mut(&g) {
-                    st.dirty = true;
+                    st.stored(&g, events, self.cfg.fast_path);
                 } else if let Some((m, inbox)) = core.owners.get(&g) {
                     if *m != self.cfg.member_id {
-                        hints.entry(inbox.clone()).or_default().push(g);
+                        hints.entry(inbox.clone()).or_default().extend(events);
                     }
                 }
             }
         }
         self.wake.notify_one();
-        for (inbox, groups) in hints {
+        for (inbox, events) in hints {
             self.stats.hints_sent.fetch_add(1, Relaxed);
-            let _ = self.fabric.publish(inbox, envelope(Body::Hint(v1::Hint { groups }))).await;
+            let _ = self.fabric.publish(inbox, envelope(Body::Hint(v1::Hint { groups: vec![], events }))).await;
         }
     }
 
@@ -645,7 +720,7 @@ impl<B: Backend> Dispatcher<B> {
             .flat_map(|b| b.items.iter().filter(|r| r.ok && r.done))
             .map(|r| EventKey { source: r.source.clone(), seq: r.seq })
             .collect();
-        let removed: Vec<Option<CommitOutcome>> = if removals.is_empty() {
+        let removed: Vec<Option<(CommitOutcome, Option<Head>)>> = if removals.is_empty() {
             vec![]
         } else {
             match self.backend.remove(&removals).await {
@@ -688,13 +763,22 @@ impl<B: Backend> Dispatcher<B> {
         };
         self.stats.commit_batches.fetch_add(1, Relaxed);
         let mut k = 0;
-        let mut done: Vec<(String, String, i64, bool)> = vec![]; // (group, source, seq, outcome known) released from in-flight
+        // (group, source, seq, outcome known, for "done" removals: the source's next event) released from in-flight
+        let mut done: Vec<(String, String, i64, bool, Option<Option<Head>>)> = vec![];
         let mut result_acks: HashMap<String, Vec<v1::ResultAck>> = HashMap::new();
         for b in batch {
             let mut acks = vec![];
             for r in &b.items {
+                let mut next: Option<Option<Head>> = None; // Some: a "done" removal, with the source's next event
                 let status = if r.ok && r.done {
-                    let st = match removed[j] {
+                    let (o, n) = match removed[j].clone() {
+                        Some((o, n)) => (Some(o), n),
+                        None => (None, None),
+                    };
+                    if o.is_some() {
+                        next = Some(n);
+                    }
+                    let st = match o {
                         Some(CommitOutcome::Applied) => {
                             self.stats.applied.fetch_add(1, Relaxed);
                             v1::ResultStatus::ResultApplied
@@ -745,7 +829,7 @@ impl<B: Backend> Dispatcher<B> {
                 // Release it either way: on an error nothing changed in Octopus's tables, so offer it again now (flagged:
                 // a "done" worker has committed its own writes already).
                 let known = status != v1::ResultStatus::ResultError && status != v1::ResultStatus::ResultGap;
-                done.push((r.group.clone(), r.source.clone(), r.seq, known || !r.done));
+                done.push((r.group.clone(), r.source.clone(), r.seq, known || !r.done, next));
                 acks.push(v1::ResultAck { request_id: r.request_id, status: status as i32 });
             }
             if !b.reply_to.is_empty() {
@@ -759,17 +843,35 @@ impl<B: Backend> Dispatcher<B> {
         self.send_batched(replies).await;
         {
             let mut core = self.core.lock().unwrap();
-            for (g, s, q, outcome_known) in done {
+            for (g, s, q, outcome_known, next) in done {
                 if let Some(st) = core.groups.get_mut(&g) {
                     if st.inflight.get(&s).is_some_and(|f| f.seq == q) {
                         st.inflight.remove(&s);
                     }
                     if outcome_known {
-                        st.suspect.remove(&(s, q));
+                        st.suspect.remove(&(s.clone(), q));
                     } else {
-                        st.suspect.insert((s, q));
+                        st.suspect.insert((s.clone(), q));
                     }
-                    st.dirty = true;
+                    match next {
+                        // removed: the database told us the source's next event (or that none is due yet)
+                        Some(n) if self.cfg.fast_path => {
+                            let c = st.cursor.entry(s.clone()).or_insert(0);
+                            *c = (*c).max(q);
+                            match n {
+                                Some(mut h) => {
+                                    h.group = g.clone();
+                                    st.offer(h);
+                                }
+                                None => {
+                                    if st.known_max.get(&s).is_some_and(|m| *m > q) {
+                                        st.dirty = true; // stored meanwhile, or waiting for a retry delay
+                                    }
+                                }
+                            }
+                        }
+                        _ => st.dirty = true,
+                    }
                 }
             }
         }

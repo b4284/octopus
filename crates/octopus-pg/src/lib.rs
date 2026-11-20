@@ -116,6 +116,7 @@ impl Backend for PgBackend {
             .into_iter()
             .map(|c| match c {
                 0 => PublishOutcome::Stored,
+                3 => PublishOutcome::StoredHead,
                 2 => PublishOutcome::GroupMismatch,
                 _ => PublishOutcome::Duplicate,
             })
@@ -198,25 +199,38 @@ impl Backend for PgBackend {
             .collect())
     }
 
-    async fn remove(&self, keys: &[EventKey]) -> Result<Vec<CommitOutcome>> {
+    async fn remove(&self, keys: &[EventKey]) -> Result<Vec<(CommitOutcome, Option<Head>)>> {
         if keys.is_empty() {
             return Ok(vec![]);
         }
         let src: Vec<&str> = keys.iter().map(|k| k.source.as_str()).collect();
         let seq: Vec<i64> = keys.iter().map(|k| k.seq).collect();
-        let eff: Vec<&[u8]> = vec![&[][..]; keys.len()];
         let c = self.client().await?;
-        let st = c.prepare_cached(&self.q("SELECT octopus.commit_many($1, $2, $3, NULL)")).await.map_err(db)?;
-        let row = c.query_one(&st, &[&src, &seq, &eff]).await.map_err(db)?;
-        let codes: Vec<i16> = row.get(0);
-        Ok(codes
-            .into_iter()
-            .map(|c| match c {
+        let st = c
+            .prepare_cached(&self.q(
+                "SELECT i, rc, next_seq, next_body, next_attempts, next_enqueued_us FROM octopus.remove_next($1, $2) ORDER BY i",
+            ))
+            .await
+            .map_err(db)?;
+        let rows = c.query(&st, &[&src, &seq]).await.map_err(db)?;
+        let mut out: Vec<(CommitOutcome, Option<Head>)> = vec![(CommitOutcome::Gap, None); keys.len()];
+        for r in rows {
+            let i = r.get::<_, i32>(0) as usize - 1;
+            let outcome = match r.get::<_, i16>(1) {
                 0 => CommitOutcome::Applied,
                 1 => CommitOutcome::Duplicate,
                 _ => CommitOutcome::Gap,
-            })
-            .collect())
+            };
+            let next = r.get::<_, Option<i64>>(2).map(|q| Head {
+                group: String::new(), // filled in by the caller (it knows the source's group)
+                key: EventKey { source: keys[i].source.clone(), seq: q },
+                body: Bytes::from(r.get::<_, Vec<u8>>(3)),
+                attempts: r.get(4),
+                enqueued_at_us: r.get(5),
+            });
+            out[i] = (outcome, next);
+        }
+        Ok(out)
     }
 
     async fn fail(&self, key: &EventKey, delay: Duration) -> Result<()> {

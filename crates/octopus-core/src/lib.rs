@@ -37,8 +37,10 @@ pub struct Event {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PublishOutcome {
-    /// Newly stored.
+    /// Newly stored; not its source's next event yet (an earlier one is still pending).
     Stored,
+    /// Newly stored, and it is its source's next event (seq = cursor + 1) right now: ready to hand out.
+    StoredHead,
     /// Already stored, or already applied: nothing to do (a producer retry).
     Duplicate,
     /// The source already belongs to another group: rejected.
@@ -126,7 +128,8 @@ pub trait Backend: Send + Sync + 'static {
 
     /// A worker reported "done" (it committed its own writes): remove these events so they are never handed out
     /// again. Idempotent: Applied = removed now; Duplicate = already removed. No apply hook runs.
-    fn remove(&self, keys: &[EventKey]) -> impl Future<Output = Result<Vec<CommitOutcome>>> + Send;
+    /// Also returns each source's next event if it is stored and due (so it can be handed out without a search).
+    fn remove(&self, keys: &[EventKey]) -> impl Future<Output = Result<Vec<(CommitOutcome, Option<Head>)>>> + Send;
 
     /// Record a failed attempt; the event is not handed out again before `delay` has passed.
     fn fail(&self, key: &EventKey, delay: Duration) -> impl Future<Output = Result<()>> + Send;

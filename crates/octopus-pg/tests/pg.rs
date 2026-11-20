@@ -82,7 +82,7 @@ async fn publish_is_idempotent_and_keeps_the_group() {
     let b = backend().await;
     let (g, g2, s) = (uniq("g"), uniq("g"), uniq("s"));
     let r = b.publish(&[ev(&g, &s, 1, "a"), ev(&g, &s, 2, "b")]).await.unwrap();
-    assert_eq!(r, vec![PublishOutcome::Stored, PublishOutcome::Stored]);
+    assert_eq!(r, vec![PublishOutcome::StoredHead, PublishOutcome::Stored]);
     // a producer retry
     let r = b.publish(&[ev(&g, &s, 2, "b"), ev(&g, &s, 3, "c")]).await.unwrap();
     assert_eq!(r, vec![PublishOutcome::Duplicate, PublishOutcome::Stored]);
@@ -149,6 +149,24 @@ async fn failing_apply_hook_rolls_back_the_whole_batch() {
     // nothing moved: both heads are still there
     assert_eq!(b.read_heads(&[req(&g, 10)]).await.unwrap().len(), 2);
     assert_eq!(b.commit(&[commit(&s1, 1, "ok")]).await.unwrap(), vec![CommitOutcome::Applied]);
+}
+
+#[tokio::test]
+async fn remove_returns_the_next_event() {
+    let b = backend().await;
+    let (g, s) = (uniq("g"), uniq("s"));
+    b.publish(&[ev(&g, &s, 1, "a"), ev(&g, &s, 2, "b")]).await.unwrap();
+    let r = b.remove(&[EventKey::new(&s, 1)]).await.unwrap();
+    assert_eq!(r[0].0, CommitOutcome::Applied);
+    let next = r[0].1.as_ref().expect("seq 2 is next");
+    assert_eq!((next.key.seq, next.body.as_ref()), (2, &b"b"[..]));
+    // again: already removed; the next event is still 2
+    let r = b.remove(&[EventKey::new(&s, 1)]).await.unwrap();
+    assert_eq!(r[0].0, CommitOutcome::Duplicate);
+    let r = b.remove(&[EventKey::new(&s, 2)]).await.unwrap();
+    assert_eq!(r[0], (CommitOutcome::Applied, None));
+    // a publish of the now-next event reports it as the head
+    assert_eq!(b.publish(&[ev(&g, &s, 3, "c")]).await.unwrap(), vec![PublishOutcome::StoredHead]);
 }
 
 #[tokio::test]

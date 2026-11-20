@@ -149,9 +149,21 @@ message Demand {
   repeated string worker_ids = 5;   // the workers on the receiving inbox this is for
 }
 
-// Dispatcher -> owning dispatcher: these groups have new events.
+// Dispatcher -> owning dispatcher: events it stored for groups the receiver owns, so the owner can hand them out
+// without searching. head = the event was its source's next one when stored; body is included for heads up to
+// 64 KB (larger ones, and plain group entries, make the owner read the group's heads).
 message Hint {
   repeated string groups = 1;
+  repeated HintEvent events = 2;
+}
+
+message HintEvent {
+  string group = 1;
+  string source = 2;
+  int64 seq = 3;
+  bool head = 4;
+  optional bytes body = 5;
+  int64 enqueued_us = 6;
 }
 
 // Worker -> dispatcher: still working on these events (extends the delivery timeout).

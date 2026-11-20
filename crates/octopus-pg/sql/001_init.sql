@@ -34,6 +34,8 @@ CREATE TABLE IF NOT EXISTS octopus.event (
 ) WITH (fillfactor = 90, autovacuum_vacuum_scale_factor = 0, autovacuum_vacuum_threshold = 5000,
         autovacuum_vacuum_insert_scale_factor = 0, autovacuum_vacuum_insert_threshold = 20000,
         autovacuum_vacuum_cost_delay = 0);
+-- Bodies are stored as they are: compressing multi-megabyte events on every insert costs more CPU than it saves.
+ALTER TABLE octopus.event ALTER COLUMN body SET STORAGE EXTERNAL;
 
 -- Dispatcher membership (heartbeats on the database clock).
 CREATE TABLE IF NOT EXISTS octopus.member (
@@ -52,7 +54,7 @@ CREATE TABLE IF NOT EXISTS octopus.lease (
 
 -- Publish: register groups and sources, then insert each event only if its seq is beyond the cursor
 -- (an event at or below the cursor is already applied). Returns per event: 0 stored, 1 duplicate,
--- 2 the source belongs to another group.
+-- 2 the source belongs to another group, 3 stored and it is the source's head (seq = cursor + 1) right now.
 --
 -- A publish racing with the commit of the same (source, seq) can still insert a row at or below the cursor
 -- (the insert waits for the commit's delete and then proceeds). Such a row is never a head; the next commit
@@ -62,11 +64,14 @@ RETURNS smallint[] LANGUAGE plpgsql AS $$
 DECLARE
     r smallint[];
 BEGIN
+    -- register only what is new (an index probe each; ON CONFLICT would attempt every insert)
     INSERT INTO octopus.grp (name)
-        SELECT DISTINCT g FROM unnest(p_grp) AS g ORDER BY 1
+        SELECT DISTINCT g FROM unnest(p_grp) AS g
+         WHERE NOT EXISTS (SELECT 1 FROM octopus.grp x WHERE x.name = g) ORDER BY 1
         ON CONFLICT DO NOTHING;
     INSERT INTO octopus.source (source, grp)
-        SELECT DISTINCT ON (s) s, g FROM unnest(p_source, p_grp) AS u(s, g) ORDER BY s
+        SELECT DISTINCT ON (s) s, g FROM unnest(p_source, p_grp) AS u(s, g)
+         WHERE NOT EXISTS (SELECT 1 FROM octopus.source x WHERE x.source = u.s) ORDER BY s
         ON CONFLICT DO NOTHING;
     WITH u AS (
         SELECT * FROM unnest(p_grp, p_source, p_seq, p_body) WITH ORDINALITY AS u(g, s, q, b, i)
@@ -80,10 +85,12 @@ BEGIN
         RETURNING source, seq
     )
     SELECT array_agg(CASE WHEN src.grp <> u.g THEN 2
-                          WHEN EXISTS (SELECT 1 FROM ins WHERE ins.source = u.s AND ins.seq = u.q) THEN 0
+                          WHEN ins.source IS NOT NULL AND u.q = src.last_seq + 1 THEN 3
+                          WHEN ins.source IS NOT NULL THEN 0
                           ELSE 1 END ORDER BY u.i)
       INTO r
-      FROM u JOIN octopus.source src ON src.source = u.s;
+      FROM u JOIN octopus.source src ON src.source = u.s
+      LEFT JOIN ins ON ins.source = u.s AND ins.seq = u.q;
     RETURN r;
 END $$;
 
@@ -127,6 +134,23 @@ BEGIN
      USING (SELECT source, last_seq FROM octopus.source WHERE source = ANY(p_source)) s
      WHERE e.source = s.source AND e.seq <= s.last_seq;
     RETURN rc;
+END $$;
+
+-- Remove events reported done (workers committed their own writes), and return each source's next event if it
+-- is stored, so the dispatcher can hand it out without searching. rc: 0 removed now, 1 already removed, 2 gap.
+CREATE OR REPLACE FUNCTION octopus.remove_next(p_source text[], p_seq bigint[])
+RETURNS TABLE(i int, rc smallint, next_seq bigint, next_body bytea, next_attempts int, next_enqueued_us bigint)
+LANGUAGE plpgsql AS $$
+DECLARE
+    codes smallint[];
+BEGIN
+    codes := octopus.commit_many(p_source, p_seq, array_fill(''::bytea, ARRAY[coalesce(array_length(p_source, 1), 0)]), NULL);
+    RETURN QUERY
+    SELECT u.o::int, codes[u.o], e.seq, e.body, e.attempts, (extract(epoch FROM e.enqueued_at) * 1000000)::bigint
+      FROM unnest(p_source) WITH ORDINALITY AS u(src, o)
+      JOIN octopus.source s ON s.source = u.src
+      LEFT JOIN octopus.event e ON e.source = u.src AND e.seq = s.last_seq + 1
+                               AND (e.not_before IS NULL OR e.not_before <= now());
 END $$;
 
 -- Rows left at or below their cursor by a publish/commit race on a source that has not committed since.
