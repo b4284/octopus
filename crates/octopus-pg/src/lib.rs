@@ -198,6 +198,27 @@ impl Backend for PgBackend {
             .collect())
     }
 
+    async fn remove(&self, keys: &[EventKey]) -> Result<Vec<CommitOutcome>> {
+        if keys.is_empty() {
+            return Ok(vec![]);
+        }
+        let src: Vec<&str> = keys.iter().map(|k| k.source.as_str()).collect();
+        let seq: Vec<i64> = keys.iter().map(|k| k.seq).collect();
+        let eff: Vec<&[u8]> = vec![&[][..]; keys.len()];
+        let c = self.client().await?;
+        let st = c.prepare_cached(&self.q("SELECT octopus.commit_many($1, $2, $3, NULL)")).await.map_err(db)?;
+        let row = c.query_one(&st, &[&src, &seq, &eff]).await.map_err(db)?;
+        let codes: Vec<i16> = row.get(0);
+        Ok(codes
+            .into_iter()
+            .map(|c| match c {
+                0 => CommitOutcome::Applied,
+                1 => CommitOutcome::Duplicate,
+                _ => CommitOutcome::Gap,
+            })
+            .collect())
+    }
+
     async fn fail(&self, key: &EventKey, delay: Duration) -> Result<()> {
         let c = self.client().await?;
         let st = c

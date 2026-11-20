@@ -89,6 +89,10 @@ message Delivery {
   int32 attempts = 6;             // failed attempts so far
   int64 enqueued_us = 7;
   string worker_id = 8;           // which worker on the receiving inbox this delivery is for
+  // This event may have been handed out before without a result reaching Octopus (a timeout, or the group changed
+  // owner): the worker may already have committed it. Workers check their idempotency key (source, seq) at least
+  // for these. False means Octopus has never handed it out before.
+  bool possibly_redelivered = 9;
 }
 
 message Deliver {
@@ -106,6 +110,9 @@ message WorkResult {
   bytes effect = 6;               // ok: passed to the apply hook in the commit transaction
   uint32 retry_delay_ms = 7;      // !ok: offer the event again after this delay
   string worker_id = 8;           // the worker this result is from (overrides ResultBatch.worker_id)
+  // ok && done: the worker committed its own writes; the dispatcher removes the event (if still pending) so it is
+  // never handed out again, and runs no apply hook. effect is ignored.
+  bool done = 9;
 }
 
 message ResultBatch {
@@ -116,8 +123,8 @@ message ResultBatch {
 
 enum ResultStatus {
   RESULT_STATUS_UNSPECIFIED = 0;
-  RESULT_APPLIED = 1;
-  RESULT_DUPLICATE = 2;           // already applied (a repeated delivery): nothing changed
+  RESULT_APPLIED = 1;             // done: removed / commit: applied
+  RESULT_DUPLICATE = 2;           // already removed or applied: a repeated delivery
   RESULT_GAP = 3;                 // an earlier event is not applied yet: nothing changed
   RESULT_FAILURE_RECORDED = 4;
   RESULT_ERROR = 5;               // the database call failed: nothing changed; the event comes back after the timeout
@@ -130,6 +137,16 @@ message ResultAck {
 
 message ResultReply {
   repeated ResultAck items = 1;
+}
+
+// Dispatcher -> workers of a group: events are ready but this dispatcher holds no credit for them. A worker moves
+// idle credits (granted to dispatchers that have nothing to hand out) here.
+message Demand {
+  string member_id = 1;
+  string inbox = 2;
+  string group = 3;
+  uint32 ready = 4;
+  repeated string worker_ids = 5;   // the workers on the receiving inbox this is for
 }
 
 // Dispatcher -> owning dispatcher: these groups have new events.
@@ -159,5 +176,6 @@ message Envelope {
     Hint hint = 6;
     Progress progress = 7;
     EnvelopeBatch batch = 8;
+    Demand demand = 9;
   }
 }

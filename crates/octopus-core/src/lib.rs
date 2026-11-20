@@ -124,6 +124,10 @@ pub trait Backend: Send + Sync + 'static {
     /// Apply results. One transaction for the whole batch; one outcome per commit, in order.
     fn commit(&self, commits: &[Commit]) -> impl Future<Output = Result<Vec<CommitOutcome>>> + Send;
 
+    /// A worker reported "done" (it committed its own writes): remove these events so they are never handed out
+    /// again. Idempotent: Applied = removed now; Duplicate = already removed. No apply hook runs.
+    fn remove(&self, keys: &[EventKey]) -> impl Future<Output = Result<Vec<CommitOutcome>>> + Send;
+
     /// Record a failed attempt; the event is not handed out again before `delay` has passed.
     fn fail(&self, key: &EventKey, delay: Duration) -> impl Future<Output = Result<()>> + Send;
 

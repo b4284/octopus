@@ -4,6 +4,9 @@
 
 CREATE SCHEMA IF NOT EXISTS octopus;
 
+-- Workers never touch Octopus's tables (an earlier draft had a function for that).
+DROP FUNCTION IF EXISTS octopus.complete(text, bigint);
+
 -- Every group ever published to (the unit of ownership).
 CREATE TABLE IF NOT EXISTS octopus.grp (
     name       text PRIMARY KEY,

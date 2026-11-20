@@ -4,6 +4,7 @@
 
 use std::collections::HashMap;
 use std::process::{Child, Command, Stdio};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
@@ -48,12 +49,19 @@ struct Dispatcher(Child);
 
 impl Dispatcher {
     fn start(ns: &str, member: &str) -> Self {
-        let child = Command::new(env!("CARGO_BIN_EXE_octopusd"))
+        Self::start_with(ns, member, Some("octo_test.apply"))
+    }
+
+    fn start_with(ns: &str, member: &str, apply_hook: Option<&str>) -> Self {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_octopusd"));
+        if let Some(h) = apply_hook {
+            cmd.env("OCTOPUS_APPLY_HOOK", h);
+        }
+        let child = cmd
             .env("OCTOPUS_MEMBER_ID", member)
             .env("OCTOPUS_NS", ns)
             .env("OCTOPUS_SCHEMA", ns)
             .env("OCTOPUS_PG", pg())
-            .env("OCTOPUS_APPLY_HOOK", "octo_test.apply")
             .env("OCTOPUS_LEASE_TTL_MS", "1500")
             .env("OCTOPUS_TICK_MS", "250")
             .env("OCTOPUS_DELIVERY_TIMEOUT_MS", "3000")
@@ -251,4 +259,60 @@ async fn a_failing_apply_hook_does_not_hold_back_other_sources() {
     wait_all_applied(&sources, 20, Duration::from_secs(60)).await;
     let _ = stop_tx.send(true);
     let _ = worker.await;
+}
+
+/// Workers own their writes and never touch Octopus's tables: BEGIN; skip if (source, seq) is already in their table
+/// (the idempotency key); INSERT; COMMIT; then report done. One time in ten the worker "crashes" right after its
+/// commit (the done report is lost): Octopus hands the event out again after the delivery timeout, flagged
+/// possibly_redelivered, the worker finds it already applied, and the table still holds each event exactly once.
+struct OwnCommit {
+    calls: AtomicU64,
+    unflagged_repeats: Arc<AtomicU64>,
+}
+
+impl Handler for OwnCommit {
+    async fn handle(&self, d: Delivery) -> Outcome {
+        let mut c = db().await;
+        let tx = c.transaction().await.unwrap();
+        let n = tx
+            .execute("INSERT INTO octo_test.applied VALUES ($1, $2, 'own') ON CONFLICT (source, seq) DO NOTHING", &[&d.source, &d.seq])
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        if n == 0 && !d.possibly_redelivered {
+            self.unflagged_repeats.fetch_add(1, Ordering::Relaxed); // a repeat Octopus did not warn about
+        }
+        if n == 1 && self.calls.fetch_add(1, Ordering::Relaxed) % 10 == 3 {
+            return Outcome::Vanish; // committed, then "crashed" before saying done
+        }
+        Outcome::Done
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn workers_commit_their_own_writes_and_report_done() {
+    let ns = uniq("e2e");
+    let (groups, sources) = setup(&ns, 3, 20).await;
+    let _d1 = Dispatcher::start_with(&ns, "d1", None);
+    let _d2 = Dispatcher::start_with(&ns, "d2", None);
+    let (stop_tx, stop_rx) = watch::channel(false);
+    let unflagged = Arc::new(AtomicU64::new(0));
+    let mut workers = vec![];
+    for i in 0..2 {
+        let id = format!("{ns}-w{i}");
+        let h = OwnCommit { calls: AtomicU64::new(i), unflagged_repeats: unflagged.clone() };
+        // every worker serves every group, so its slots are split between two owning dispatchers
+        let (w, rx) = Worker::connect(MqttConfig::new("127.0.0.1", 1883, id.clone()), WorkerConfig::new(id, ns.clone(), groups.clone(), 8), h)
+            .await
+            .unwrap();
+        workers.push(tokio::spawn(w.run(rx, stop_rx.clone())));
+    }
+    publish_all(&ns, &groups, &sources, 15).await;
+    wait_all_applied(&sources, 15, Duration::from_secs(90)).await;
+    assert_eq!(backlog(&ns).await, 0);
+    assert_eq!(unflagged.load(Ordering::Relaxed), 0, "every repeated delivery must be flagged possibly_redelivered");
+    let _ = stop_tx.send(true);
+    for w in workers {
+        let _ = w.await;
+    }
 }

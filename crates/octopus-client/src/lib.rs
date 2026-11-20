@@ -125,10 +125,16 @@ impl Producer {
 
 /// What the handler decided.
 pub enum Outcome {
-    /// Done: the effect is passed to the apply hook in the commit transaction.
+    /// The handler committed its own writes (ideally calling `octopus.complete(source, seq)` in that transaction):
+    /// the dispatcher removes the event so it is never handed out again.
+    Done,
+    /// Done: the effect is passed to the apply hook in the commit transaction (hook mode).
     Commit(Bytes),
     /// Failed: offer the event again after this delay.
     Retry(Duration),
+    /// Send nothing, as if the worker crashed now (tests: the delivery timeout offers the event again).
+    #[doc(hidden)]
+    Vanish,
 }
 
 pub trait Handler: Send + Sync + 'static {
@@ -293,6 +299,9 @@ impl<H: Handler> Worker<H> {
         {
             match e {
                 v1::Envelope { body: Some(Body::Deliver(d)) } => self.on_deliver(d),
+                v1::Envelope { body: Some(Body::Demand(d)) } => {
+                    tokio::spawn(async move { self.on_demand(d).await });
+                }
                 v1::Envelope { body: Some(Body::ResultReply(r)) } => {
                     for a in r.items {
                         match v1::ResultStatus::try_from(a.status) {
@@ -328,6 +337,15 @@ impl<H: Handler> Worker<H> {
                 let outcome = me.handler.handle(item).await;
                 let mut r = v1::WorkResult { request_id: me.next_req.fetch_add(1, Relaxed), group, source: source.clone(), seq, ..Default::default() };
                 match outcome {
+                    Outcome::Vanish => {
+                        me.state.lock().unwrap().running.remove(&source);
+                        return;
+                    }
+                    Outcome::Done => {
+                        me.stats.committed.fetch_add(1, Relaxed);
+                        r.ok = true;
+                        r.done = true;
+                    }
                     Outcome::Commit(effect) => {
                         me.stats.committed.fetch_add(1, Relaxed);
                         r.ok = true;
@@ -357,6 +375,48 @@ impl<H: Handler> Worker<H> {
                 me.state.lock().unwrap().running.remove(&source);
                 me.rebalance().await;
             });
+        }
+    }
+
+    /// A dispatcher has ready events but none of our credit: give it our free slots, or move credit from owners that
+    /// hold it idle (they are told the reduced amount; one they already spent just means a brief overcommit).
+    async fn on_demand(&self, d: v1::Demand) {
+        if !self.cfg.groups.contains(&d.group) {
+            return;
+        }
+        let mut sends: Vec<(String, u32, bool)> = vec![];
+        {
+            let mut st = self.state.lock().unwrap();
+            if !st.members.contains_key(&d.member_id) {
+                return;
+            }
+            let outstanding: u32 = st.granted.values().sum();
+            let busy = st.running.len() as u32;
+            let mut want = d.ready.max(1);
+            let mut give = self.cfg.slots.saturating_sub(outstanding + busy).min(want);
+            want -= give;
+            let others: Vec<String> = st.granted.iter().filter(|(m, n)| **m != d.member_id && **n > 0).map(|(m, _)| m.clone()).collect();
+            for o in others {
+                if want == 0 {
+                    break;
+                }
+                let n = st.granted.get_mut(&o).unwrap();
+                let take = (*n).min(want);
+                *n -= take;
+                let left = *n;
+                want -= take;
+                give += take;
+                if let Some(inbox) = st.members.get(&o) {
+                    sends.push((inbox.clone(), left, true));
+                }
+            }
+            if give > 0 {
+                *st.granted.entry(d.member_id.clone()).or_default() += give;
+                sends.push((d.inbox.clone(), give, false));
+            }
+        }
+        for (inbox, n, reset) in sends {
+            self.send_credit(&inbox, n, reset).await;
         }
     }
 

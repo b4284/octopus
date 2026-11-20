@@ -92,6 +92,12 @@ struct GroupState {
     dirty: bool,
     fetching: bool,
     last_fetch: Option<Instant>,
+    /// Events this dispatcher handed out whose outcome is unknown (timed out, or "done" hit a database error):
+    /// a repeat must carry possibly_redelivered.
+    suspect: HashSet<(String, i64)>,
+    /// Events stored before this instant (Unix µs, with slack) may have been handed out by the previous owner.
+    claimed_us: i64,
+    last_demand: Option<Instant>,
 }
 
 struct WorkerState {
@@ -136,15 +142,37 @@ impl Core {
         self.lease_deadline.is_some_and(|d| now < d)
     }
 
-    /// Match ready heads with credited workers. Returns deliveries grouped by worker inbox.
-    fn assign(&mut self, now: Instant, timeout: Duration) -> Vec<(String, Vec<v1::Delivery>)> {
+    /// Match ready heads with credited workers. Returns deliveries grouped by worker inbox, and demands (groups with
+    /// ready events but no credit here) grouped by worker inbox.
+    fn assign(&mut self, now: Instant, timeout: Duration) -> (Vec<(String, Vec<v1::Delivery>)>, Vec<(String, v1::Demand)>) {
         let mut out: HashMap<String, Vec<v1::Delivery>> = HashMap::new();
+        let mut demands: Vec<(String, v1::Demand)> = vec![];
         if !self.handing_out(now) {
-            return vec![];
+            return (vec![], vec![]);
         }
         let Core { groups, workers, by_group, .. } = self;
         for (g, st) in groups.iter_mut().filter(|(_, st)| st.serving && !st.ready.is_empty()) {
             let Some(ws) = by_group.get(g) else { continue };
+            let credited = ws.iter().any(|w| workers.get(w).is_some_and(|x| x.credit > 0));
+            if !credited {
+                // events are ready but the group's workers hold no credit here: ask them to move idle credit
+                if st.last_demand.is_none_or(|t| now.duration_since(t) >= Duration::from_millis(100)) {
+                    st.last_demand = Some(now);
+                    let mut per_inbox: HashMap<&str, Vec<String>> = HashMap::new();
+                    for w in ws {
+                        if let Some(x) = workers.get(w) {
+                            per_inbox.entry(x.inbox.as_str()).or_default().push(w.clone());
+                        }
+                    }
+                    for (inbox, worker_ids) in per_inbox {
+                        demands.push((
+                            inbox.to_owned(),
+                            v1::Demand { member_id: String::new(), inbox: String::new(), group: g.clone(), ready: st.ready.len() as u32, worker_ids },
+                        ));
+                    }
+                }
+                continue;
+            }
             while !st.ready.is_empty() {
                 // the credited worker with the most credit
                 let Some(wid) = ws.iter().filter(|w| workers.get(*w).is_some_and(|x| x.credit > 0)).max_by_key(|w| workers[*w].credit)
@@ -159,6 +187,8 @@ impl Core {
                 let w = workers.get_mut(&wid).unwrap();
                 w.credit -= 1;
                 st.inflight.insert(r.head.key.source.clone(), InFlight { seq: r.head.key.seq, deadline: now + timeout });
+                let possibly_redelivered =
+                    st.suspect.contains(&(r.head.key.source.clone(), r.head.key.seq)) || r.head.enqueued_at_us <= st.claimed_us;
                 out.entry(w.inbox.clone()).or_default().push(v1::Delivery {
                     group: r.head.group,
                     source: r.head.key.source,
@@ -168,10 +198,11 @@ impl Core {
                     attempts: r.head.attempts,
                     enqueued_us: r.head.enqueued_at_us,
                     worker_id: wid.clone(),
+                    possibly_redelivered,
                 });
             }
         }
-        out.into_iter().collect()
+        (out.into_iter().collect(), demands)
     }
 
     /// Groups that need a head read: serving, credited beyond what is ready, and dirty or due for a fallback read.
@@ -209,6 +240,8 @@ pub struct Stats {
     pub publish_duplicates: AtomicU64,
     pub publish_batches: AtomicU64,
     pub applied: AtomicU64,
+    /// "done" reports for events the worker already completed in its own transaction
+    pub completed_by_worker: AtomicU64,
     pub duplicates: AtomicU64,
     pub gaps: AtomicU64,
     pub failures: AtomicU64,
@@ -603,9 +636,28 @@ impl<B: Backend> Dispatcher<B> {
     async fn commit_batch(&self, batch: Vec<PendingResults>) {
         let commits: Vec<Commit> = batch
             .iter()
-            .flat_map(|b| b.items.iter().filter(|r| r.ok))
+            .flat_map(|b| b.items.iter().filter(|r| r.ok && !r.done))
             .map(|r| Commit { key: EventKey { source: r.source.clone(), seq: r.seq }, effect: r.effect.clone() })
             .collect();
+        // "done": the worker committed its own writes; remove the event if it is still pending (no hook)
+        let removals: Vec<EventKey> = batch
+            .iter()
+            .flat_map(|b| b.items.iter().filter(|r| r.ok && r.done))
+            .map(|r| EventKey { source: r.source.clone(), seq: r.seq })
+            .collect();
+        let removed: Vec<Option<CommitOutcome>> = if removals.is_empty() {
+            vec![]
+        } else {
+            match self.backend.remove(&removals).await {
+                Ok(o) => o.into_iter().map(Some).collect(),
+                Err(e) => {
+                    self.stats.commit_errors.fetch_add(1, Relaxed);
+                    warn!(error = %e, n = removals.len(), "remove batch failed");
+                    vec![None; removals.len()]
+                }
+            }
+        };
+        let mut j = 0;
         // One outcome per commit; None = not committed (database error).
         let outcomes: Vec<Option<CommitOutcome>> = if commits.is_empty() {
             vec![]
@@ -636,12 +688,30 @@ impl<B: Backend> Dispatcher<B> {
         };
         self.stats.commit_batches.fetch_add(1, Relaxed);
         let mut k = 0;
-        let mut done: Vec<(String, String, i64)> = vec![]; // (group, source, seq) released from in-flight
+        let mut done: Vec<(String, String, i64, bool)> = vec![]; // (group, source, seq, outcome known) released from in-flight
         let mut result_acks: HashMap<String, Vec<v1::ResultAck>> = HashMap::new();
         for b in batch {
             let mut acks = vec![];
             for r in &b.items {
-                let status = if r.ok {
+                let status = if r.ok && r.done {
+                    let st = match removed[j] {
+                        Some(CommitOutcome::Applied) => {
+                            self.stats.applied.fetch_add(1, Relaxed);
+                            v1::ResultStatus::ResultApplied
+                        }
+                        Some(CommitOutcome::Duplicate) => {
+                            self.stats.completed_by_worker.fetch_add(1, Relaxed);
+                            v1::ResultStatus::ResultDuplicate
+                        }
+                        Some(CommitOutcome::Gap) => {
+                            self.stats.gaps.fetch_add(1, Relaxed);
+                            v1::ResultStatus::ResultGap
+                        }
+                        None => v1::ResultStatus::ResultError,
+                    };
+                    j += 1;
+                    st
+                } else if r.ok {
                     let st = match outcomes[k] {
                         Some(o) => match o {
                             CommitOutcome::Applied => {
@@ -672,8 +742,10 @@ impl<B: Backend> Dispatcher<B> {
                         }
                     }
                 };
-                // Release it either way: on an error nothing changed in the database, so offer it again now.
-                done.push((r.group.clone(), r.source.clone(), r.seq));
+                // Release it either way: on an error nothing changed in Octopus's tables, so offer it again now (flagged:
+                // a "done" worker has committed its own writes already).
+                let known = status != v1::ResultStatus::ResultError && status != v1::ResultStatus::ResultGap;
+                done.push((r.group.clone(), r.source.clone(), r.seq, known || !r.done));
                 acks.push(v1::ResultAck { request_id: r.request_id, status: status as i32 });
             }
             if !b.reply_to.is_empty() {
@@ -687,10 +759,15 @@ impl<B: Backend> Dispatcher<B> {
         self.send_batched(replies).await;
         {
             let mut core = self.core.lock().unwrap();
-            for (g, s, q) in done {
+            for (g, s, q, outcome_known) in done {
                 if let Some(st) = core.groups.get_mut(&g) {
                     if st.inflight.get(&s).is_some_and(|f| f.seq == q) {
                         st.inflight.remove(&s);
+                    }
+                    if outcome_known {
+                        st.suspect.remove(&(s, q));
+                    } else {
+                        st.suspect.insert((s, q));
                     }
                     st.dirty = true;
                 }
@@ -716,7 +793,7 @@ impl<B: Backend> Dispatcher<B> {
                 let sends = core.assign(now, self.cfg.delivery_timeout);
                 (sends, core.due_fetches(now, self.cfg.fallback_poll))
             };
-            self.send_deliveries(sends).await;
+            self.send_assignments(sends).await;
             for chunk in reqs.chunks(self.cfg.fetch_max_groups) {
                 let chunk = chunk.to_vec();
                 let permit = fetch_slots.clone().acquire_owned().await.unwrap();
@@ -769,7 +846,7 @@ impl<B: Backend> Dispatcher<B> {
             warn!(error = %e, "head read failed");
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
-        self.send_deliveries(sends).await;
+        self.send_assignments(sends).await;
         self.wake.notify_one();
     }
 
@@ -785,6 +862,15 @@ impl<B: Backend> Dispatcher<B> {
                 warn!(error = %e, "reply send failed (the sender retries)");
             }
         }
+    }
+
+    async fn send_assignments(&self, (sends, demands): (Vec<(String, Vec<v1::Delivery>)>, Vec<(String, v1::Demand)>)) {
+        for (inbox, mut d) in demands {
+            d.member_id = self.cfg.member_id.clone();
+            d.inbox = self.inbox.clone();
+            let _ = self.fabric.publish(inbox, envelope(Body::Demand(d))).await;
+        }
+        self.send_deliveries(sends).await;
     }
 
     async fn send_deliveries(&self, sends: Vec<(String, Vec<v1::Delivery>)>) {
@@ -811,7 +897,14 @@ impl<B: Backend> Dispatcher<B> {
                 let mut core = self.core.lock().unwrap();
                 for st in core.groups.values_mut() {
                     let before = st.inflight.len();
-                    st.inflight.retain(|_, f| f.deadline > now);
+                    let GroupState { inflight, suspect, .. } = st;
+                    inflight.retain(|s, f| {
+                        let keep = f.deadline > now;
+                        if !keep {
+                            suspect.insert((s.clone(), f.seq)); // a result may have been lost: the worker may have committed
+                        }
+                        keep
+                    });
                     let expired = before - st.inflight.len();
                     if expired > 0 {
                         self.stats.timeouts.fetch_add(expired as u64, Relaxed);
@@ -929,7 +1022,9 @@ impl<B: Backend> Dispatcher<B> {
                 {
                     let mut core = self.core.lock().unwrap();
                     for l in &got {
-                        core.groups.insert(l.group.clone(), GroupState { serving: true, dirty: true, ..Default::default() });
+                        // events stored before now (+1 s for clock skew) may have been handed out by the previous owner
+                        let claimed_us = now_us() + 1_000_000;
+                        core.groups.insert(l.group.clone(), GroupState { serving: true, dirty: true, claimed_us, ..Default::default() });
                     }
                 }
                 self.stats.claims.fetch_add(got.len() as u64, Relaxed);
@@ -972,6 +1067,7 @@ impl<B: Backend> Dispatcher<B> {
             info!(
                 groups, workers, inflight, ready,
                 published = s.published.load(Relaxed), applied = s.applied.load(Relaxed),
+                completed_by_worker = s.completed_by_worker.load(Relaxed),
                 duplicates = s.duplicates.load(Relaxed), failures = s.failures.load(Relaxed),
                 timeouts = s.timeouts.load(Relaxed), commit_batches = s.commit_batches.load(Relaxed),
                 fetches = s.fetches.load(Relaxed), "stats"
