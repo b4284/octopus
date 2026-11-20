@@ -307,6 +307,10 @@ buffers without limit and never drops.
   position; every position below an applied one was applied, recorded as skipped, or declared lost by a stored
   marker; and an acknowledged event is never skipped. Writing the model exposed that a skip must give up only positions not
   stored at that moment (an event stored between the gap check and the skip was otherwise lost).
+  Checked (2026-11-21, TLC 2.19): exhaustive with 1 dispatcher and 2 seqs per epoch (25.5M distinct states) and
+  with 2 dispatchers and 1 seq per epoch (0.5M); 2.59 billion states of random simulation with 2 dispatchers,
+  2 workers and 2 seqs per epoch; and 239M distinct states of the full 2-dispatcher instance before it was
+  stopped unfinished. No violation.
 
 ## 6. Failure walk-through
 
