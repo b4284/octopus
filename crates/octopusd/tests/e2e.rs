@@ -309,7 +309,13 @@ async fn workers_commit_their_own_writes_and_report_done() {
     }
     publish_all(&ns, &groups, &sources, 15).await;
     wait_all_applied(&sources, 15, Duration::from_secs(90)).await;
-    assert_eq!(backlog(&ns).await, 0);
+    // the worker's table can be complete while Octopus still holds events whose done report was lost: they come
+    // back after the delivery timeout, are found applied, reported done, and removed
+    let until = Instant::now() + Duration::from_secs(20);
+    while backlog(&ns).await > 0 {
+        assert!(Instant::now() < until, "backlog did not drain");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
     assert_eq!(unflagged.load(Ordering::Relaxed), 0, "every repeated delivery must be flagged possibly_redelivered");
     let _ = stop_tx.send(true);
     for w in workers {
