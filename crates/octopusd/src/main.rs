@@ -7,6 +7,7 @@
 //! | `OCTOPUS_BACKEND` | `pg` (PostgreSQL), `mssql` (SQL Server 2025) or `mysql` (MySQL 8.4) |
 //! | `OCTOPUS_PG` | `host=127.0.0.1 port=5432 user=octopus dbname=octopus` |
 //! | `OCTOPUS_MSSQL` (ADO.NET style) | `server=tcp:127.0.0.1,1433;database=octopus;user=octopus;TrustServerCertificate=true` |
+//! | `OCTOPUS_MSSQL_INMEMORY` (`1`: the event table memory-optimized; fixed per database) | `0` |
 //! | `OCTOPUS_MYSQL` (URL) | `mysql://octopus@127.0.0.1:3306/octopus` |
 //! | `OCTOPUS_PG_POOL` (any backend) | `32` |
 //! | `OCTOPUS_SCHEMA` | `octopus` (MySQL: the table prefix `<schema>_`) |
@@ -78,6 +79,7 @@ async fn main() {
         "mssql" => {
             let mut c = MssqlConfig::new(env("OCTOPUS_MSSQL", "server=tcp:127.0.0.1,1433;database=octopus;user=octopus;TrustServerCertificate=true"));
             (c.pool_size, c.schema, c.apply_hook, c.load_hook) = (pool, schema, apply_hook, load_hook);
+            c.in_memory = env("OCTOPUS_MSSQL_INMEMORY", "0") == "1";
             serve(cfg, retry(|| MssqlBackend::connect(c.clone())).await).await
         }
         "mysql" => {

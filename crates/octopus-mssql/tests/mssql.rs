@@ -1,5 +1,6 @@
 //! Integration tests against a real SQL Server 2025: the same tests as the PostgreSQL backend's (crates/octopus-pg/tests).
-//! Connection: OCTOPUS_TEST_MSSQL (default: the lab container, database octopus_test).
+//! Connection: OCTOPUS_TEST_MSSQL (default: the lab container, database octopus_test). OCTOPUS_TEST_MSSQL_INMEMORY=1
+//! runs them with the memory-optimized event table (on a database of its own: the mode is fixed per database).
 //! Each test uses its own group and source names, so tests run in parallel on one database.
 
 use std::collections::HashMap;
@@ -70,6 +71,7 @@ async fn backend() -> MssqlBackend {
     let mut cfg = MssqlConfig::new(conn_str());
     cfg.apply_hook = Some("octo_test.apply".into());
     cfg.load_hook = Some("octo_test.load_ctx".into());
+    cfg.in_memory = std::env::var("OCTOPUS_TEST_MSSQL_INMEMORY").is_ok_and(|v| v == "1");
     MssqlBackend::connect(cfg).await.expect("backend")
 }
 

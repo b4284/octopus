@@ -47,11 +47,23 @@ pub struct MssqlConfig {
     /// Load hook: a procedure `(@j nvarchar(max))` with JSON `[{"i", "s", "q", "b": base64 body}]` returning rows
     /// `(i int, context varbinary(max))`, `i` the 1-based position.
     pub load_hook: Option<String>,
+    /// The event table memory-optimized (In-Memory OLTP): no locks, latches or ghost rows on the hottest table. The
+    /// database gets a MEMORY_OPTIMIZED_DATA filegroup (in the instance's default data path) and
+    /// MEMORY_OPTIMIZED_ELEVATE_TO_SNAPSHOT on the first start. A database's mode is fixed by its first migration.
+    pub in_memory: bool,
 }
 
 impl MssqlConfig {
     pub fn new(connection: impl Into<String>) -> Self {
-        Self { connection: connection.into(), pool_size: 16, migrate: true, schema: "octopus".into(), apply_hook: None, load_hook: None }
+        Self {
+            connection: connection.into(),
+            pool_size: 16,
+            migrate: true,
+            schema: "octopus".into(),
+            apply_hook: None,
+            load_hook: None,
+            in_memory: false,
+        }
     }
 }
 
@@ -120,13 +132,59 @@ pub struct MssqlBackend {
     apply_hook: Option<String>,
     load_hook: Option<String>,
     deadlocks: std::sync::atomic::AtomicU64,
+    in_memory: bool,
 }
 
 const KNOWN_MAX: usize = 1_000_000;
 
-/// The script's statement batches (separated by lines holding only GO), for the given schema.
-fn schema_batches(schema: &str) -> Vec<String> {
-    let sql = SCHEMA_SQL
+/// The memory-optimized event table (created outside the migration's transaction: In-Memory DDL cannot run inside
+/// one). As the disk-based table, but: no UTF-8 collations in memory-optimized tables (`grp` is UTF-16, binary order:
+/// only compared for equality), a nonclustered range index for the key, no IGNORE_DUP_KEY (publish checks), and the
+/// markers index unfiltered.
+const EVENT_IN_MEMORY: &str = "
+CREATE TABLE octopus.event (
+    sid         bigint NOT NULL,
+    epoch       bigint NOT NULL,
+    seq         bigint NOT NULL,
+    grp         nvarchar(256) COLLATE Latin1_General_100_BIN2 NOT NULL,
+    enqueued_at datetime2(6) NOT NULL DEFAULT SYSUTCDATETIME(),
+    attempts    int NOT NULL DEFAULT 0,
+    not_before  datetime2(6) NULL,
+    skip_to     bigint NULL,
+    body_hash   bigint NULL,
+    body        varbinary(max) NOT NULL,
+    CONSTRAINT event_pkey PRIMARY KEY NONCLUSTERED (sid, epoch, seq),
+    INDEX event_markers NONCLUSTERED (sid, skip_to)
+) WITH (MEMORY_OPTIMIZED = ON, DURABILITY = SCHEMA_AND_DATA);";
+
+/// The script for the in-memory event table: its DDL moves out (EVENT_IN_MEMORY), lock hints the table does not take
+/// go (memory-optimized tables have no locks: conflicting writers fail and are retried), and publish skips stored
+/// rows itself. Every replacement must match exactly once (checked by a test).
+const IN_MEMORY_EDITS: &[(&str, &str)] = &[
+    ("IF OBJECT_ID('octopus.event') IS NULL\nCREATE TABLE octopus.event (", "IF 1 = 0\nCREATE TABLE octopus.event_disk_based ("),
+    ("ALTER TABLE octopus.event SET (LOCK_ESCALATION = DISABLE);\n", ""),
+    ("ALTER INDEX event_pkey ON octopus.event SET (ALLOW_PAGE_LOCKS = OFF);\n", ""),
+    (
+        "IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'event_markers' AND object_id = OBJECT_ID('octopus.event'))\n    CREATE INDEX event_markers ON octopus.event (sid) WHERE skip_to IS NOT NULL;\n",
+        "",
+    ),
+    ("JOIN octopus.event e WITH (ROWLOCK, READPAST, FORCESEEK)", "JOIN octopus.event e WITH (FORCESEEK)"),
+    (
+        "     WHERE x.sgrp = x.g AND (x.e > x.ce OR (x.e = x.ce AND x.q > x.cs))\n     ORDER BY x.sid, x.e, x.q;",
+        "     WHERE x.sgrp = x.g AND (x.e > x.ce OR (x.e = x.ce AND x.q > x.cs))\n       AND NOT EXISTS (SELECT 1 FROM octopus.event y WHERE y.sid = x.sid AND y.epoch = x.e AND y.seq = x.q)\n     ORDER BY x.sid, x.e, x.q;",
+    ),
+];
+
+/// The script's statement batches (separated by lines holding only GO), for the given schema and event table kind.
+fn schema_batches(schema: &str, in_memory: bool) -> Vec<String> {
+    let mut sql = SCHEMA_SQL.to_owned();
+    if in_memory {
+        for (from, to) in IN_MEMORY_EDITS {
+            sql = sql.replace(from, to);
+        }
+        sql = sql.replace("JOIN octopus.event e WITH (ROWLOCK, FORCESEEK)", "JOIN octopus.event e WITH (FORCESEEK)");
+    }
+    let sql = sql
         .replace("SCHEMA_ID('octopus')", &format!("SCHEMA_ID('{schema}')"))
         .replace("CREATE SCHEMA octopus", &format!("CREATE SCHEMA {schema}"))
         .replace("octopus.", &format!("{schema}."));
@@ -149,9 +207,12 @@ fn schema_batches(schema: &str) -> Vec<String> {
     out
 }
 
-/// SQL Server error numbers worth a retry of a whole migration: deadlock victim, snapshot update conflict.
-fn retryable(e: &tiberius::error::Error) -> bool {
-    matches!(e, tiberius::error::Error::Server(t) if t.code() == 1205 || t.code() == 3960)
+/// SQL Server error numbers worth a retry of a whole operation: deadlock victim, snapshot update conflict, and the
+/// In-Memory OLTP conflicts (write-write 41302, validation 41305/41325, commit dependency 41301, 41839); with the
+/// in-memory event table also a duplicate key (2627: two publishes inserting the same event, no IGNORE_DUP_KEY there).
+fn retryable(e: &tiberius::error::Error, in_memory: bool) -> bool {
+    matches!(e, tiberius::error::Error::Server(t)
+        if matches!(t.code(), 1205 | 3960 | 41302 | 41305 | 41325 | 41301 | 41839) || (in_memory && t.code() == 2627))
 }
 
 impl MssqlBackend {
@@ -168,6 +229,7 @@ impl MssqlBackend {
             apply_hook: cfg.apply_hook,
             load_hook: cfg.load_hook,
             deadlocks: Default::default(),
+            in_memory: cfg.in_memory,
         };
         if cfg.migrate {
             b.migrate().await?;
@@ -184,7 +246,22 @@ impl MssqlBackend {
     /// Runs the schema script when the installed version differs from this build's (hash kept in <schema>.meta),
     /// one migrator at a time (an exclusive application lock), re-checking under the lock.
     async fn migrate(&self) -> Result<()> {
-        let batches = schema_batches(&self.schema);
+        if self.in_memory {
+            self.prepare_in_memory().await?;
+        }
+        let kind = format!(
+            "SELECT CAST(OBJECTPROPERTY(OBJECT_ID('{}.event'), 'TableIsMemoryOptimized') AS int)",
+            self.schema
+        );
+        let existing = self.rows(&kind, &[]).await?.first().and_then(|r| r.get::<i32, _>(0));
+        if let Some(m) = existing.filter(|m| (*m == 1) != self.in_memory) {
+            return Err(Error::Config(format!(
+                "the event table is {} but in_memory = {}: a database's mode is fixed by its first migration",
+                if m == 1 { "memory-optimized" } else { "disk-based" },
+                self.in_memory
+            )));
+        }
+        let batches = schema_batches(&self.schema, self.in_memory);
         let version = format!("{:016x}", xxhash_rust::xxh3::xxh3_64(batches.concat().as_bytes()));
         let meta = format!("{}.meta", self.schema);
         let check = format!("IF OBJECT_ID('{meta}') IS NULL SELECT CAST(NULL AS nvarchar(64)) ELSE SELECT value FROM {meta} WHERE [key] = N'schema'");
@@ -229,13 +306,45 @@ impl MssqlBackend {
                 Err(e) => {
                     // the connection may still hold the transaction: it is closed, not pooled
                     attempt += 1;
-                    if !retryable(&e) || attempt >= 20 {
+                    if !retryable(&e, self.in_memory) || attempt >= 20 {
                         return Err(db(e));
                     }
                     tokio::time::sleep(Duration::from_millis(50 * attempt)).await;
                 }
             }
         }
+    }
+
+    /// In-Memory OLTP needs a MEMORY_OPTIMIZED_DATA filegroup, snapshot isolation for memory-optimized tables in
+    /// explicit transactions (MEMORY_OPTIMIZED_ELEVATE_TO_SNAPSHOT), and its DDL outside any transaction: done here,
+    /// one migrator at a time (a session application lock), before the migration's transaction.
+    async fn prepare_in_memory(&self) -> Result<()> {
+        let schema = &self.schema;
+        let table = EVENT_IN_MEMORY.replace("octopus.", &format!("{schema}."));
+        let sql = format!(
+            "EXEC sp_getapplock @Resource = N'octopus-migrate', @LockMode = 'Exclusive', @LockOwner = 'Session', @LockTimeout = 600000;
+             IF NOT EXISTS (SELECT 1 FROM sys.filegroups WHERE type = 'FX')
+             BEGIN
+                 DECLARE @db sysname = DB_NAME();
+                 DECLARE @fg sysname = @db + N'_imfg';
+                 DECLARE @path nvarchar(400) = CAST(SERVERPROPERTY('InstanceDefaultDataPath') AS nvarchar(400));
+                 DECLARE @add nvarchar(max) = N'ALTER DATABASE ' + QUOTENAME(@db) + N' ADD FILEGROUP ' + QUOTENAME(@fg) + N' CONTAINS MEMORY_OPTIMIZED_DATA';
+                 EXEC(@add);
+                 SET @add = N'ALTER DATABASE ' + QUOTENAME(@db) + N' ADD FILE (NAME = N''' + @fg + N''', FILENAME = N''' + @path + @fg + N''') TO FILEGROUP ' + QUOTENAME(@fg);
+                 EXEC(@add);
+             END;
+             IF (SELECT is_memory_optimized_elevate_to_snapshot_on FROM sys.databases WHERE database_id = DB_ID()) = 0
+                 EXEC(N'ALTER DATABASE CURRENT SET MEMORY_OPTIMIZED_ELEVATE_TO_SNAPSHOT = ON');
+             IF SCHEMA_ID('{schema}') IS NULL EXEC(N'CREATE SCHEMA {schema}');
+             IF OBJECT_ID('{schema}.event') IS NULL EXEC(N'{}');
+             EXEC sp_releaseapplock @Resource = N'octopus-migrate', @LockOwner = 'Session';",
+            table.replace('\'', "''")
+        );
+        // (on an error the connection is dropped, not pooled: the session lock goes with it)
+        let mut p = self.pool.get().await?;
+        p.c().simple_query(sql).await.map_err(db)?.into_results().await.map_err(db)?;
+        p.ok();
+        Ok(())
     }
 
     /// Statement text with the configured schema.
@@ -257,7 +366,7 @@ impl MssqlBackend {
                     p.ok();
                     return Ok(r);
                 }
-                Err(e) if retryable(&e) && attempt < 10 => {
+                Err(e) if retryable(&e, self.in_memory) && attempt < 10 => {
                     p.ok(); // the server rolled the victim back; the connection is fine
                     attempt += 1;
                     self.deadlocks.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -738,5 +847,22 @@ impl Backend for MssqlBackend {
     async fn purge_applied(&self, limit: i32) -> Result<i64> {
         let rows = self.rows(&self.q("EXEC octopus.purge_applied @P1"), &[&limit]).await?;
         Ok(rows.first().map(|r| i64_(r, 0)).unwrap_or(0))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The in-memory variant is derived from the disk-based script by text edits: each must still match exactly once.
+    #[test]
+    fn in_memory_edits_each_match_once() {
+        for (from, _) in IN_MEMORY_EDITS {
+            assert_eq!(SCHEMA_SQL.matches(from).count(), 1, "{from}");
+        }
+        let im = schema_batches("octopus", true).concat();
+        assert!(!im.contains("octopus.event e WITH (ROWLOCK"), "a lock hint on the event table is left");
+        assert!(!im.contains("CREATE TABLE octopus.event ("));
+        assert!(im.contains("AND NOT EXISTS (SELECT 1 FROM octopus.event y WHERE y.sid = x.sid"));
     }
 }
