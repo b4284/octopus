@@ -159,7 +159,8 @@ CREATE TABLE octopus.event (
 
 /// The script for the in-memory event table: its DDL moves out (EVENT_IN_MEMORY), lock hints the table does not take
 /// go (memory-optimized tables have no locks: conflicting writers fail and are retried), and publish skips stored
-/// rows itself. Every replacement must match exactly once (checked by a test).
+/// rows itself, by a forced seek (compiled while the table was nearly empty, the check became a table scan per
+/// publish and runs collapsed to ~9k ev/s: matrix-33). Every replacement must match exactly once (checked by a test).
 const IN_MEMORY_EDITS: &[(&str, &str)] = &[
     ("IF OBJECT_ID('octopus.event') IS NULL\nCREATE TABLE octopus.event (", "IF 1 = 0\nCREATE TABLE octopus.event_disk_based ("),
     ("ALTER TABLE octopus.event SET (LOCK_ESCALATION = DISABLE);\n", ""),
@@ -169,9 +170,15 @@ const IN_MEMORY_EDITS: &[(&str, &str)] = &[
         "",
     ),
     ("JOIN octopus.event e WITH (ROWLOCK, READPAST, FORCESEEK)", "JOIN octopus.event e WITH (FORCESEEK)"),
+    // (forced seeks for the other lookups too: plans compiled on a nearly empty table scan it)
+    (
+        "((SELECT TOP (1) COALESCE(y.skip_to, y.seq) FROM octopus.event y\n",
+        "((SELECT TOP (1) COALESCE(y.skip_to, y.seq) FROM octopus.event y WITH (FORCESEEK)\n",
+    ),
+    ("y.body_hash FROM octopus.event y\n", "y.body_hash FROM octopus.event y WITH (FORCESEEK)\n"),
     (
         "     WHERE x.sgrp = x.g AND (x.e > x.ce OR (x.e = x.ce AND x.q > x.cs))\n     ORDER BY x.sid, x.e, x.q;",
-        "     WHERE x.sgrp = x.g AND (x.e > x.ce OR (x.e = x.ce AND x.q > x.cs))\n       AND NOT EXISTS (SELECT 1 FROM octopus.event y WHERE y.sid = x.sid AND y.epoch = x.e AND y.seq = x.q)\n     ORDER BY x.sid, x.e, x.q;",
+        "     WHERE x.sgrp = x.g AND (x.e > x.ce OR (x.e = x.ce AND x.q > x.cs))\n       AND NOT EXISTS (SELECT 1 FROM octopus.event y WITH (FORCESEEK) WHERE y.sid = x.sid AND y.epoch = x.e AND y.seq = x.q)\n     ORDER BY x.sid, x.e, x.q;",
     ),
 ];
 
@@ -863,6 +870,6 @@ mod tests {
         let im = schema_batches("octopus", true).concat();
         assert!(!im.contains("octopus.event e WITH (ROWLOCK"), "a lock hint on the event table is left");
         assert!(!im.contains("CREATE TABLE octopus.event ("));
-        assert!(im.contains("AND NOT EXISTS (SELECT 1 FROM octopus.event y WHERE y.sid = x.sid"));
+        assert!(im.contains("AND NOT EXISTS (SELECT 1 FROM octopus.event y WITH (FORCESEEK) WHERE y.sid = x.sid"));
     }
 }
