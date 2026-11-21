@@ -54,10 +54,15 @@ impl PgConfig {
 
 pub struct PgBackend {
     pool: Pool,
+    /// sources and groups known to be registered (publish skips the registration statements for a batch of these)
+    known: std::sync::Mutex<std::collections::HashSet<String>>,
     schema: String,
     apply_hook: Option<String>,
     load_sql: Option<String>,
 }
+
+/// Most sources and groups a backend remembers as registered (beyond that the cache starts again).
+const KNOWN_MAX: usize = 1_000_000;
 
 fn db(e: impl Into<DbErr>) -> Error {
     Error::Database(e.into().0)
@@ -154,7 +159,7 @@ impl PgBackend {
                 }
             }
         }
-        Ok(Self { pool, schema: cfg.schema, apply_hook: cfg.apply_hook, load_sql })
+        Ok(Self { pool, known: Default::default(), schema: cfg.schema, apply_hook: cfg.apply_hook, load_sql })
     }
 
     /// Statement text with the configured schema.
@@ -185,17 +190,32 @@ impl Backend for PgBackend {
         if events.iter().any(|e| e.key.pos.seq < 1 || e.key.pos.epoch < 0 || e.skip_to.is_some_and(|k| k < e.key.pos.seq)) {
             return Err(Error::Invalid("seq starts at 1, epoch is not negative, skip_to >= seq".into()));
         }
+        let all_known = {
+            let k = self.known.lock().unwrap();
+            events.iter().all(|e| k.contains(&e.key.source) && k.contains(&format!("\u{1}{}", e.group)))
+        };
         let c = self.client().await?;
         let st = c
-            .prepare_cached(&self.q("SELECT codes, missing FROM octopus.publish($1, $2, $3, $4, $5, $6, $7, $8, $9)"))
+            .prepare_cached(&self.q("SELECT codes, missing FROM octopus.publish($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)"))
             .await
             .map_err(db)?;
         let row = c
-            .query_one(&st, &[&grp, &src, &epoch, &seq, &body, &hash, &skip_to, &prev_epoch, &prev_last])
+            .query_one(&st, &[&grp, &src, &epoch, &seq, &body, &hash, &skip_to, &prev_epoch, &prev_last, &all_known])
             .await
             .map_err(db)?;
         let codes: Vec<i16> = row.get(0);
         let missing: Vec<i64> = row.get(1);
+        if !all_known {
+            // registered now (a group mismatch still means the source exists); bounded: cleared when it grows too big
+            let mut k = self.known.lock().unwrap();
+            if k.len() > KNOWN_MAX {
+                k.clear();
+            }
+            for e in events {
+                k.insert(e.key.source.clone());
+                k.insert(format!("\u{1}{}", e.group));
+            }
+        }
         Ok(codes
             .into_iter()
             .zip(missing)

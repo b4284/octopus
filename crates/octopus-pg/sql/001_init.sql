@@ -56,6 +56,8 @@ CREATE TABLE IF NOT EXISTS octopus.event (
         autovacuum_vacuum_cost_delay = 0);
 -- Bodies are stored as they are: compressing multi-megabyte events on every insert costs more CPU than it saves.
 ALTER TABLE octopus.event ALTER COLUMN body SET STORAGE EXTERNAL;
+-- Skip markers only (rare): settle() finds them without looking at every stored event.
+CREATE INDEX IF NOT EXISTS event_markers ON octopus.event (sid) WHERE skip_to IS NOT NULL;
 
 -- Where a source's epoch ended: declared by the first events of the next epoch, or set when an epoch is closed
 -- after the gap timeout. A cursor at (epoch, last_seq) moves on to (next_epoch, 0).
@@ -109,18 +111,23 @@ CREATE TABLE IF NOT EXISTS octopus.lease (
 CREATE OR REPLACE FUNCTION octopus.settle(p_sid bigint[])
 RETURNS void LANGUAGE plpgsql AS $$
 BEGIN
-    LOOP
-        UPDATE octopus.source s SET epoch = x.next_epoch, last_seq = 0
-          FROM octopus.epoch_end x
-         WHERE s.id = ANY(p_sid) AND x.sid = s.id AND x.epoch = s.epoch AND s.last_seq >= x.last_seq
-           AND x.next_epoch > s.epoch;
-        EXIT WHEN NOT FOUND;
-    END LOOP;
-    INSERT INTO octopus.skipped (sid, epoch, from_seq, to_seq, reason)
-        SELECT e.sid, e.epoch, e.seq, e.skip_to, 'declared by the source'
-          FROM octopus.event e JOIN octopus.source s ON s.id = e.sid
-         WHERE e.sid = ANY(p_sid) AND e.skip_to IS NOT NULL AND (e.epoch, e.seq) <= (s.epoch, s.last_seq)
-        ON CONFLICT DO NOTHING;
+    -- (both steps are rare: test cheaply before doing them)
+    IF EXISTS (SELECT 1 FROM octopus.epoch_end x WHERE x.sid = ANY(p_sid)) THEN
+        LOOP
+            UPDATE octopus.source s SET epoch = x.next_epoch, last_seq = 0
+              FROM octopus.epoch_end x
+             WHERE s.id = ANY(p_sid) AND x.sid = s.id AND x.epoch = s.epoch AND s.last_seq >= x.last_seq
+               AND x.next_epoch > s.epoch;
+            EXIT WHEN NOT FOUND;
+        END LOOP;
+    END IF;
+    IF EXISTS (SELECT 1 FROM octopus.event e WHERE e.sid = ANY(p_sid) AND e.skip_to IS NOT NULL) THEN
+        INSERT INTO octopus.skipped (sid, epoch, from_seq, to_seq, reason)
+            SELECT e.sid, e.epoch, e.seq, e.skip_to, 'declared by the source'
+              FROM octopus.event e JOIN octopus.source s ON s.id = e.sid
+             WHERE e.sid = ANY(p_sid) AND e.skip_to IS NOT NULL AND (e.epoch, e.seq) <= (s.epoch, s.last_seq)
+            ON CONFLICT DO NOTHING;
+    END IF;
     DELETE FROM octopus.event e USING octopus.source s
      WHERE s.id = ANY(p_sid) AND e.sid = s.id AND (e.epoch, e.seq) <= (s.epoch, s.last_seq);
 END $$;
@@ -136,23 +143,27 @@ END $$;
 -- insert waits for the removal and proceeds). Such a row is never a head; octopus.purge_applied() removes it.
 DROP FUNCTION IF EXISTS octopus.publish(text[], text[], bigint[], bytea[]);
 DROP FUNCTION IF EXISTS octopus.publish(text[], text[], bigint[], bytea[], bigint[]);
+DROP FUNCTION IF EXISTS octopus.publish(text[], text[], bigint[], bigint[], bytea[], bigint[], bigint[], bigint[], bigint[]);
+-- p_known: the caller knows every source and group of the batch is registered already (skips two statements).
 CREATE OR REPLACE FUNCTION octopus.publish(p_grp text[], p_source text[], p_epoch bigint[], p_seq bigint[],
-    p_body bytea[], p_hash bigint[], p_skip_to bigint[], p_prev_epoch bigint[], p_prev_last bigint[],
+    p_body bytea[], p_hash bigint[], p_skip_to bigint[], p_prev_epoch bigint[], p_prev_last bigint[], p_known boolean,
     OUT codes smallint[], OUT missing bigint[])
 LANGUAGE plpgsql AS $$
 DECLARE
     declared bigint[];
 BEGIN
     -- register only what is new (an index probe each; ON CONFLICT would attempt every insert)
-    INSERT INTO octopus.grp (name)
-        SELECT DISTINCT g FROM unnest(p_grp) AS g
-         WHERE NOT EXISTS (SELECT 1 FROM octopus.grp x WHERE x.name = g) ORDER BY 1
-        ON CONFLICT DO NOTHING;
-    INSERT INTO octopus.source (source, grp, epoch)
-        SELECT s, min(g), min(e) FROM unnest(p_source, p_grp, p_epoch) AS u(s, g, e)
-         WHERE NOT EXISTS (SELECT 1 FROM octopus.source x WHERE x.source = u.s)
-         GROUP BY s ORDER BY s
-        ON CONFLICT DO NOTHING;
+    IF NOT p_known THEN
+        INSERT INTO octopus.grp (name)
+            SELECT DISTINCT g FROM unnest(p_grp) AS g
+             WHERE NOT EXISTS (SELECT 1 FROM octopus.grp x WHERE x.name = g) ORDER BY 1
+            ON CONFLICT DO NOTHING;
+        INSERT INTO octopus.source (source, grp, epoch)
+            SELECT s, min(g), min(e) FROM unnest(p_source, p_grp, p_epoch) AS u(s, g, e)
+             WHERE NOT EXISTS (SELECT 1 FROM octopus.source x WHERE x.source = u.s)
+             GROUP BY s ORDER BY s
+            ON CONFLICT DO NOTHING;
+    END IF;
     -- declared ends of previous epochs (the first declaration wins)
     IF EXISTS (SELECT 1 FROM unnest(p_prev_epoch) AS pe WHERE pe IS NOT NULL) THEN
         WITH d AS (
@@ -192,14 +203,17 @@ BEGIN
                CASE WHEN x.sgrp <> x.g THEN 2
                     WHEN ins.sid IS NOT NULL AND x.e = x.ce AND x.q = x.cs + 1 THEN 3
                     WHEN ins.sid IS NOT NULL THEN 0
-                    WHEN ex.sid IS NOT NULL AND ex.body_hash IS NOT NULL AND ex.body_hash <> x.h THEN 4
-                    WHEN ex.sid IS NOT NULL THEN 1
+                    WHEN ex.present AND ex.body_hash IS NOT NULL AND ex.body_hash <> x.h THEN 4
+                    WHEN ex.present THEN 1
                     WHEN EXISTS (SELECT 1 FROM octopus.skipped k WHERE k.sid = x.sid AND k.epoch = x.e
                                     AND x.q >= k.from_seq AND (k.to_seq IS NULL OR x.q <= k.to_seq)) THEN 6
                     WHEN x.e < x.ce AND NOT EXISTS (SELECT 1 FROM octopus.epoch_end d
                                     WHERE d.sid = x.sid AND d.epoch = x.e AND x.q <= d.last_seq) THEN 5
                     ELSE 1 END AS code,
                CASE WHEN x.e < x.ce THEN 0
+                    -- cheap answers first: the head, or the batchmate just below
+                    WHEN x.e = x.ce AND x.q = x.cs + 1 THEN 0
+                    WHEN x.mate IS NOT NULL AND x.mate >= x.q - 1 THEN 0
                     ELSE greatest(0, x.q - 1 - greatest(
                         CASE WHEN x.e = x.ce THEN x.cs ELSE 0 END,
                         (SELECT coalesce(y.skip_to, y.seq) FROM octopus.event y
@@ -208,7 +222,9 @@ BEGIN
                END AS miss
           FROM x
           LEFT JOIN ins ON ins.sid = x.sid AND ins.epoch = x.e AND ins.seq = x.q
-          LEFT JOIN octopus.event ex ON ex.sid = x.sid AND ex.epoch = x.e AND ex.seq = x.q
+          -- a row stored before this statement, looked up only for events not inserted now
+          LEFT JOIN LATERAL (SELECT true AS present, y.body_hash FROM octopus.event y
+                              WHERE ins.sid IS NULL AND y.sid = x.sid AND y.epoch = x.e AND y.seq = x.q) ex ON true
     ), late AS (
         INSERT INTO octopus.late (sid, epoch, seq, body)
         SELECT sid, e, q, b FROM st WHERE code = 6
