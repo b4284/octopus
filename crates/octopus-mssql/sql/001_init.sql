@@ -183,7 +183,9 @@ BEGIN
     SELECT i, CAST(g COLLATE Latin1_General_100_BIN2_UTF8 AS varchar(256)), CAST(s COLLATE Latin1_General_100_BIN2_UTF8 AS varchar(256)), e, q, BASE64_DECODE(b), h, k, pe, pl
       FROM OPENJSON(@j) WITH (i int '$.i', g nvarchar(256) '$.g', s nvarchar(256) '$.s', e bigint '$.e', q bigint '$.q',
                               b varchar(max) '$.b', h bigint '$.h', k bigint '$.k', pe bigint '$.pe', pl bigint '$.pl');
-    BEGIN TRANSACTION;
+    -- Registration commits on its own, before the batch's transaction: a registered source never disappears with a
+    -- batch that rolls back, and its key lock is not held through the batch (inside the transaction, concurrent first
+    -- publishes of the same sources queued behind each other's whole batches and deadlocked).
     IF @known = 0
     BEGIN
         -- register only what is new (duplicates from concurrent publishes are ignored by the keys)
@@ -194,6 +196,7 @@ BEGIN
          WHERE NOT EXISTS (SELECT 1 FROM octopus.source x WHERE x.source = u.s)
          GROUP BY u.s;
     END;
+    BEGIN TRANSACTION;
     -- declared ends of previous epochs (the first declaration wins)
     IF EXISTS (SELECT 1 FROM @u WHERE pe IS NOT NULL)
     BEGIN

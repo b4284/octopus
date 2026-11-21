@@ -494,3 +494,43 @@ async fn a_source_believed_registered_but_missing_is_registered_not_acknowledged
     // the event must be stored (and the source registered again), never acknowledged as a duplicate
     assert_eq!(outcomes(&b, &[ev(&g, &s, 1, "a")]).await, vec![PublishOutcome::StoredHead]);
 }
+
+/// Many publishers (three dispatchers, eight concurrent tasks each) receiving the first events of the same new sources
+/// at once, as at the start of a run (a source's consecutive events reach different dispatchers): every batch succeeds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn concurrent_first_publishes_register_every_source() {
+    let g = uniq("g-reg");
+    let base = uniq("s-reg");
+    // every (source, seq) once, dealt out to 24 publishers in a pseudo-random order
+    let mut all: Vec<(String, i64)> = (0..600).flat_map(|i| (1..=4).map(move |q| (i, q))).map(|(i, q)| (format!("{base}-{i}"), q)).collect();
+    let mut x = 88172645463325252u64;
+    for n in (1..all.len()).rev() {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        all.swap(n, (x % (n as u64 + 1)) as usize);
+    }
+    let all = Arc::new(all);
+    let mut tasks = vec![];
+    for d in 0..3usize {
+        let b = Arc::new(backend().await);
+        for t in 0..8usize {
+            let (b, g, all) = (b.clone(), g.clone(), all.clone());
+            tasks.push(tokio::spawn(async move {
+                let mine: Vec<Event> = all.iter().skip(d * 8 + t).step_by(24).map(|(s, q)| ev(&g, s, *q, "x")).collect();
+                let mut errors = vec![];
+                for batch in mine.chunks(25) {
+                    if let Err(e) = b.publish(batch).await {
+                        errors.push(e.to_string());
+                    }
+                }
+                errors
+            }));
+        }
+    }
+    let mut errors = vec![];
+    for t in tasks {
+        errors.extend(t.await.unwrap());
+    }
+    assert!(errors.is_empty(), "{} failed batches, first: {}", errors.len(), errors[0]);
+}

@@ -193,7 +193,8 @@ impl MysqlBackend {
         self.deadlocks.load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// Publish batches retried because a source believed registered was not found (statistics).
+    /// Publish batches retried because a source was not found: believed registered, or a concurrent registration not
+    /// visible yet (statistics).
     pub fn unknown_retries(&self) -> u64 {
         self.unknown_retries.load(std::sync::atomic::Ordering::Relaxed)
     }
@@ -308,21 +309,29 @@ impl Backend for MysqlBackend {
             events.iter().all(|e| k.contains(&e.key.source) && k.contains(&format!("\u{1}{}", e.group)))
         };
         let j = serde_json::to_string(&items).unwrap();
-        let rows = match self.rows(&self.q("CALL octopus_publish(?, ?)"), (j.clone(), all_known as i64)).await {
-            // a source the cache believed registered is not there (or not visible yet): forget the batch's sources
-            // and retry once with registration
-            Err(Error::Database(m)) if m.contains("unknown source in publish batch") => {
-                let n = self.unknown_retries.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-                tracing::warn!(retries = n, events = events.len(), "publish: a source believed registered was not found; retrying with registration");
-                {
-                    let mut k = self.known.lock().unwrap();
-                    for e in events {
-                        k.remove(&e.key.source);
+        // A source not found aborts the batch (nothing acknowledged): the cache believed it registered, or a
+        // concurrent registration of it had not become visible yet. Retry with registration, briefly backing off.
+        let mut known = all_known;
+        let mut attempt = 0u64;
+        let rows = loop {
+            match self.rows(&self.q("CALL octopus_publish(?, ?)"), (j.clone(), known as i64)).await {
+                Err(Error::Database(m)) if m.contains("unknown source in publish batch") && attempt < 5 => {
+                    attempt += 1;
+                    let n = self.unknown_retries.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                    if known {
+                        tracing::warn!(retries = n, events = events.len(), "publish: a source believed registered was not found; retrying with registration");
+                        let mut k = self.known.lock().unwrap();
+                        for e in events {
+                            k.remove(&e.key.source);
+                        }
+                    } else {
+                        tracing::debug!(retries = n, attempt, "publish: a concurrently registered source was not visible yet; retrying");
+                        tokio::time::sleep(Duration::from_millis(2 * attempt * attempt)).await;
                     }
+                    known = false;
                 }
-                self.rows(&self.q("CALL octopus_publish(?, ?)"), (j, 0i64)).await?
+                r => break r?,
             }
-            r => r?,
         };
         if !all_known {
             let mut k = self.known.lock().unwrap();
@@ -672,24 +681,29 @@ impl Backend for MysqlBackend {
             return Ok(vec![]);
         }
         let g = serde_json::to_string(groups).unwrap();
-        // sources whose first stored position beyond the cursor is not the head. That first position comes from two
-        // bounded index seeks (the rest of the cursor's epoch, then later epochs); the time waited is that event's.
-        // (An aggregate over all of a source's later events with OR'ed range conditions ran for minutes: matrix-31.)
+        // sources whose first stored position beyond the cursor is not the head. A source whose head is stored has no
+        // gap: a point lookup, joined first (JOIN_PREFIX), rules out nearly every source. For the rest the first stored
+        // position comes from two index lookups (the rest of the cursor's epoch, then later epochs); MySQL cannot
+        // range-seek on outer-row values, so each reads that source's stored events. The time waited is that event's.
+        // (An aggregate with OR'ed range conditions ran for minutes; a later form without the head filter ran 19 min
+        // once a backlog built up: matrix-31. MAX_EXECUTION_TIME bounds any bad plan; the next sweep retries.)
         let sql = self.q(
-            "SELECT s.grp, s.source, s.epoch, s.last_seq, f.epoch, f.seq, \
+            "SELECT /*+ MAX_EXECUTION_TIME(30000) JOIN_PREFIX(x, gr, s, h) */ \
+                    s.grp, s.source, s.epoch, s.last_seq, f.epoch, f.seq, \
                     CAST(TIMESTAMPDIFF(MICROSECOND, f.enqueued_at, UTC_TIMESTAMP(6)) AS SIGNED) AS waited, gr.gap_skip_ms \
                FROM JSON_TABLE(?, '$[*]' COLUMNS (v VARCHAR(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin PATH '$')) x \
                JOIN octopus_source s ON s.grp = x.v \
                JOIN octopus_grp gr ON gr.name = s.grp \
+               LEFT JOIN octopus_event h ON h.sid = s.id AND h.epoch = s.epoch AND h.seq = s.last_seq + 1 \
                JOIN LATERAL ( \
                     SELECT u.epoch, u.seq, u.enqueued_at FROM ( \
-                        (SELECT e.epoch, e.seq, e.enqueued_at FROM octopus_event e \
+                        (SELECT e.epoch, e.seq, e.enqueued_at FROM octopus_event e FORCE INDEX (PRIMARY) \
                           WHERE e.sid = s.id AND e.epoch = s.epoch AND e.seq > s.last_seq ORDER BY e.seq LIMIT 1) \
                         UNION ALL \
-                        (SELECT e.epoch, e.seq, e.enqueued_at FROM octopus_event e \
+                        (SELECT e.epoch, e.seq, e.enqueued_at FROM octopus_event e FORCE INDEX (PRIMARY) \
                           WHERE e.sid = s.id AND e.epoch > s.epoch ORDER BY e.epoch, e.seq LIMIT 1)) u \
                      ORDER BY u.epoch, u.seq LIMIT 1) f \
-              WHERE NOT (f.epoch = s.epoch AND f.seq = s.last_seq + 1) \
+              WHERE h.sid IS NULL AND NOT (f.epoch = s.epoch AND f.seq = s.last_seq + 1) \
                 AND (? = 0 OR f.enqueued_at <= TIMESTAMPADD(MICROSECOND, -? * 1000, UTC_TIMESTAMP(6))) \
               ORDER BY waited DESC LIMIT ?",
         );

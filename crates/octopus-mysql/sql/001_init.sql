@@ -167,12 +167,16 @@ BEGIN
             s VARCHAR(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin PATH '$.s', e BIGINT PATH '$.e',
             q BIGINT PATH '$.q', b LONGTEXT PATH '$.b', h BIGINT PATH '$.h', k BIGINT PATH '$.k',
             pe BIGINT PATH '$.pe', pl BIGINT PATH '$.pl')) j;
-    START TRANSACTION;
+    -- Registration commits on its own, before the batch's transaction: a registered source never disappears with a
+    -- batch that rolls back (a deadlock victim, or an abort below), and its row lock is not held through the batch.
+    -- (Inside the transaction, a concurrent publisher's INSERT IGNORE could skip a source another transaction had
+    -- inserted and then rolled back: ~270 aborted batches at the start of each 16k ev/s run, matrix-31.)
     IF p_known = 0 THEN
         INSERT IGNORE INTO octopus_grp (name) SELECT DISTINCT u.g FROM octopus_tmp_u u ORDER BY u.g;
         INSERT IGNORE INTO octopus_source (source, grp, epoch)
         SELECT u.s, MIN(u.g), MIN(u.e) FROM octopus_tmp_u u GROUP BY u.s ORDER BY u.s;
     END IF;
+    START TRANSACTION;
     -- declared ends of previous epochs (the first declaration wins)
     IF EXISTS (SELECT 1 FROM octopus_tmp_u WHERE pe IS NOT NULL) THEN
         DELETE FROM octopus_tmp_keys;
