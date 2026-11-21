@@ -337,6 +337,15 @@ buffers without limit and never drops.
   (acknowledged writes lost). Fixed upstream in 3.5.13; with 3.5.17 the same drill keeps the new primary.
 - **Run Patroni with a watchdog** in production: it resets a node whose Patroni stalls past the leader lease, the
   defence Patroni documents against a paused primary resuming with a stale belief.
+- **Connect through a leader-following endpoint,** not a multi-host connection string. With a four-host string
+  (`target_session_attrs=read-write`), the benchmark's workers (Npgsql) stalled after a DC was killed in 3 of 7
+  drills: every database call of the process hung in lockstep while the database was idle (nothing was lost; the
+  events waited in Octopus). Through HAProxy health-checking Patroni's REST API (`/primary`) with
+  `on-marked-down shutdown-sessions`, the same drill passed 10 times out of 10. Dispatchers and workers alike use
+  the endpoint.
+- **Workers: never wait for ever, never cancel a commit.** Give up on a database call after a time limit without
+  cancelling it (close the connection, or abandon the call), treat the event as failed with an unknown outcome, and
+  let the redelivery re-check the idempotency key.
 
 ## 6. Failure walk-through
 
