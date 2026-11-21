@@ -428,8 +428,9 @@ impl Backend for PgBackend {
     async fn renew(&self, member: &str, groups: &[String], ttl: Duration) -> Result<Vec<String>> {
         let c = self.client().await?;
         let rows = c
-            .query(&self.q("UPDATE octopus.lease SET expires_at = now() + $3::text::interval \
-                  WHERE owner = $1 AND grp = ANY($2) RETURNING grp"),
+            .query(&self.q("WITH l AS (SELECT grp FROM octopus.lease WHERE owner = $1 AND grp = ANY($2) ORDER BY grp FOR UPDATE) \
+                 UPDATE octopus.lease x SET expires_at = now() + $3::text::interval FROM l \
+                  WHERE x.grp = l.grp RETURNING x.grp"),
                 &[&member, &groups, &interval(ttl)],
             )
             .await
@@ -457,7 +458,11 @@ impl Backend for PgBackend {
 
     async fn release(&self, member: &str, groups: &[String]) -> Result<()> {
         let c = self.client().await?;
-        c.execute(&self.q("DELETE FROM octopus.lease WHERE owner = $1 AND grp = ANY($2)"), &[&member, &groups])
+        c.execute(
+            &self.q("WITH l AS (SELECT grp FROM octopus.lease WHERE owner = $1 AND grp = ANY($2) ORDER BY grp FOR UPDATE) \
+                     DELETE FROM octopus.lease x USING l WHERE x.grp = l.grp"),
+            &[&member, &groups],
+        )
             .await
             .map_err(db)?;
         Ok(())
@@ -465,7 +470,13 @@ impl Backend for PgBackend {
 
     async fn leave(&self, member: &str) -> Result<()> {
         let c = self.client().await?;
-        c.execute(&self.q("DELETE FROM octopus.lease WHERE owner = $1"), &[&member]).await.map_err(db)?;
+        c.execute(
+            &self.q("WITH l AS (SELECT grp FROM octopus.lease WHERE owner = $1 ORDER BY grp FOR UPDATE) \
+                     DELETE FROM octopus.lease x USING l WHERE x.grp = l.grp"),
+            &[&member],
+        )
+        .await
+        .map_err(db)?;
         c.execute(&self.q("DELETE FROM octopus.member WHERE member_id = $1"), &[&member]).await.map_err(db)?;
         Ok(())
     }

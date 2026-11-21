@@ -122,6 +122,10 @@ struct GroupState {
     /// The lease epoch this member holds the group under (announced to clients).
     lease_epoch: i64,
     last_demand: Option<Instant>,
+    /// last head probe while holding no credit for the group
+    last_probe: Option<Instant>,
+    /// last warning that the group has ready events but no known worker
+    last_no_worker_warn: Option<Instant>,
     /// source -> last position known done by this owner (stale hints are ignored)
     cursor: HashMap<String, Pos>,
     /// source -> highest position known stored
@@ -137,6 +141,9 @@ struct GroupState {
     want_fetching: bool,
     last_want_fetch: Option<Instant>,
 }
+
+/// Look at the heads of a group this owner holds no credit for this often (see due_fetches).
+const PROBE_EVERY: Duration = Duration::from_secs(2);
 
 /// Repeat the retained member and owner announcements this often (lease ticks; 10 x 500 ms = 5 s).
 const ANNOUNCE_EVERY_TICKS: u64 = 10;
@@ -350,7 +357,13 @@ impl Core {
             if st.ready.is_empty() {
                 continue;
             }
-            let Some(ws) = by_group.get(g) else { continue };
+            let Some(ws) = by_group.get(g).filter(|ws| !ws.is_empty()) else {
+                if st.last_no_worker_warn.is_none_or(|t| now.duration_since(t) >= Duration::from_secs(60)) {
+                    st.last_no_worker_warn = Some(now);
+                    warn!(group = %g, ready = st.ready.len(), "events are ready but no worker of the group has contacted this owner");
+                }
+                continue;
+            };
             let credited = ws.iter().any(|w| workers.get(w).is_some_and(|x| x.usable()));
             if !credited {
                 // events are ready but the group's workers hold no credit here: ask them to move idle credit
@@ -454,6 +467,17 @@ impl Core {
             }
             let want = credits[g] as usize;
             if want <= st.ready.len() {
+                // No credit here and nothing known to hand out: look at the heads now and then anyway. A head found
+                // makes assign() ask the group's workers for credit (Demand); without this probe, an owner that holds
+                // no credit (its workers credit someone else, e.g. during an ownership change) would never see that
+                // the group has work and the group would wait for good.
+                if want == 0 && st.ready.is_empty() && st.last_probe.is_none_or(|t| now.duration_since(t) >= PROBE_EVERY) {
+                    st.last_probe = Some(now);
+                    st.fetching = true;
+                    st.dirty = false;
+                    let exclude = st.inflight.keys().cloned().collect();
+                    reqs.push(HeadRequest { group: g.clone(), max: 1, exclude_sources: exclude });
+                }
                 continue;
             }
             if !st.dirty && st.last_fetch.is_some_and(|t| now.duration_since(t) < fallback) {
@@ -526,6 +550,8 @@ pub struct Dispatcher<B: Backend> {
     retry_tx: Mutex<Option<mpsc::Sender<PendingResults>>>,
     pub stats: Stats,
     started_us: i64,
+    /// (last successful heartbeat, claim no new groups before this instant): see lease_tick
+    heartbeat_state: Mutex<(Option<Instant>, Option<Instant>)>,
 }
 
 fn now_us() -> i64 {
@@ -556,6 +582,7 @@ impl<B: Backend> Dispatcher<B> {
             retry_tx: Mutex::new(None),
             stats: Stats::default(),
             started_us: now_us(),
+            heartbeat_state: Mutex::new((None, None)),
         })
     }
 
@@ -1511,6 +1538,19 @@ impl<B: Backend> Dispatcher<B> {
     async fn lease_tick(&self, me: &Member, live: &mut Vec<String>, all_groups: &mut Vec<String>, ticks: u64) -> octopus_core::Result<()> {
         let ttl = self.cfg.lease_ttl;
         let members: Vec<String> = self.backend.heartbeat(me, ttl).await?.into_iter().map(|m| m.id).collect();
+        // Back from a database outage longer than the lease TTL: every member's heartbeat looks expired, so whoever
+        // comes back first would see itself alone and claim every group, only to hand most of them over again a few
+        // seconds later (each move costs a drain and redeliveries). Claim nothing new for one TTL: the others have
+        // heartbeat by then.
+        {
+            let now = Instant::now();
+            let mut hb = self.heartbeat_state.lock().unwrap();
+            if hb.0.is_some_and(|prev| now.duration_since(prev) > ttl) {
+                hb.1 = Some(now + ttl);
+                warn!(gap_ms = now.duration_since(hb.0.unwrap()).as_millis() as u64, "database unreachable longer than the lease ttl: claiming no new groups for one ttl");
+            }
+            hb.0 = Some(now);
+        }
         if members != *live {
             info!(members = ?members, "membership changed");
             *live = members;
@@ -1568,7 +1608,8 @@ impl<B: Backend> Dispatcher<B> {
             let core = self.core.lock().unwrap();
             desired.iter().filter(|g| !core.groups.contains_key(**g)).map(|g| (*g).clone()).collect()
         };
-        if !want.is_empty() {
+        let holding = self.heartbeat_state.lock().unwrap().1.is_some_and(|t| Instant::now() < t);
+        if !want.is_empty() && !holding {
             let got = self.backend.claim(&me.id, &want, ttl).await?;
             if !got.is_empty() {
                 {
