@@ -68,6 +68,8 @@ pub struct Producer {
     /// A publish not acknowledged after this long is reported (a warning and [`Producer::stuck`]).
     pub alert_after: Duration,
     stuck: AtomicU64,
+    /// positions published by this producer and not acknowledged yet: (source, epoch, seq)
+    in_flight: Mutex<std::collections::HashSet<(String, i64, i64)>>,
 }
 
 impl Producer {
@@ -87,6 +89,7 @@ impl Producer {
             max_attempts: 0,
             alert_after: Duration::from_secs(30),
             stuck: AtomicU64::new(0),
+            in_flight: Mutex::default(),
         });
         let pending = p.pending.clone();
         tokio::spawn(async move {
@@ -106,6 +109,62 @@ impl Producer {
 
     /// Publishes and returns one answer per item, once the events are committed. Retries until acknowledged.
     pub async fn publish(&self, items: Vec<PublishItem>) -> Result<Vec<Ack>> {
+        let keys: Vec<(String, i64, i64)> =
+            items.iter().filter(|i| !i.high_water).map(|i| (i.source.clone(), i.epoch, i.seq)).collect();
+        self.in_flight.lock().unwrap().extend(keys.iter().cloned());
+        let r = self.publish_once(items).await;
+        let mut f = self.in_flight.lock().unwrap();
+        for k in &keys {
+            f.remove(k);
+        }
+        r
+    }
+
+    /// The source's last position is (epoch, seq): returns how many positions directly up to and including it are
+    /// neither stored nor applied (a lost last event shows up here; no later publish would reveal it).
+    pub async fn announce(&self, group: &str, source: &str, epoch: i64, seq: i64) -> Result<i64> {
+        let item = PublishItem { group: group.into(), source: source.into(), epoch, seq, high_water: true, ..Default::default() };
+        Ok(self.publish(vec![item]).await?.first().map(|a| a.missing_below).unwrap_or(0))
+    }
+
+    /// Repairs positions `from_seq ..= to_seq` of an epoch that Octopus reported missing (an acknowledgement's
+    /// `missing_below`, or [`Producer::announce`]): positions this producer still has in flight are left alone (they
+    /// arrive on their own); `replay` supplies the body of each other one it can (e.g. from an outbox), and every
+    /// run of positions it cannot is declared lost with one skip marker. Returns (replayed, skipped).
+    pub async fn repair(
+        &self, group: &str, source: &str, epoch: i64, from_seq: i64, to_seq: i64, replay: impl Fn(i64) -> Option<Bytes>,
+    ) -> Result<(u64, u64)> {
+        let mut items = vec![];
+        let (mut replayed, mut skipped) = (0u64, 0u64);
+        let mut run: Option<(i64, i64)> = None; // a run of positions to declare lost
+        let flush = |run: &mut Option<(i64, i64)>, items: &mut Vec<PublishItem>, skipped: &mut u64| {
+            if let Some((a, b)) = run.take() {
+                *skipped += (b - a + 1) as u64;
+                items.push(PublishItem { group: group.into(), source: source.into(), epoch, seq: a, skip_to: Some(b), ..Default::default() });
+            }
+        };
+        for q in from_seq..=to_seq {
+            if self.in_flight.lock().unwrap().contains(&(source.to_owned(), epoch, q)) {
+                flush(&mut run, &mut items, &mut skipped);
+                continue;
+            }
+            match replay(q) {
+                Some(body) => {
+                    flush(&mut run, &mut items, &mut skipped);
+                    replayed += 1;
+                    items.push(PublishItem { group: group.into(), source: source.into(), epoch, seq: q, body, ..Default::default() });
+                }
+                None => run = Some((run.map_or(q, |r| r.0), q)),
+            }
+        }
+        flush(&mut run, &mut items, &mut skipped);
+        if !items.is_empty() {
+            self.publish(items).await?;
+        }
+        Ok((replayed, skipped))
+    }
+
+    async fn publish_once(&self, items: Vec<PublishItem>) -> Result<Vec<Ack>> {
         let Some(first) = items.first() else { return Ok(vec![]) };
         let topic = self.topics.publish(&first.group);
         let mut req = v1::PublishRequest { reply_to: self.inbox.clone(), request_id: 0, items };

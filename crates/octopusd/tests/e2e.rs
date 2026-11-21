@@ -486,3 +486,45 @@ async fn skips_epochs_and_gap_timeouts_reach_the_worker_in_order() {
     let _ = stop_tx.send(true);
     let _ = worker.await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn producers_repair_what_octopus_reports_missing() {
+    let ns = uniq("e2e");
+    let (groups, _) = setup(&ns, 1, 0).await;
+    let g = groups[0].clone();
+    let _d = Dispatcher::start(&ns, "d1");
+    let (stop_tx, stop_rx) = watch::channel(false);
+    let seen = Arc::new(Mutex::new(vec![]));
+    let id = format!("{ns}-w");
+    let (w, rx) = Worker::connect(MqttConfig::new("127.0.0.1", 1883, id.clone()), WorkerConfig::new(id, ns.clone(), groups.clone(), 4), Recorder(seen.clone()))
+        .await
+        .unwrap();
+    let worker = tokio::spawn(w.run(rx, stop_rx.clone()));
+    let producer = Producer::connect(MqttConfig::new("127.0.0.1", 1883, format!("{ns}-p")), &ns, &format!("{ns}-p")).await.unwrap();
+    let item = |s: &str, seq: i64| PublishItem { group: g.clone(), source: format!("{ns}-{s}"), epoch: 1, seq, body: Bytes::from(format!("{s}/{seq}")), ..Default::default() };
+    // r: 3 was lost and cannot be replayed: the acknowledgement of 4 says so, repair declares it lost
+    let acks = producer.publish(vec![item("r", 1), item("r", 2), item("r", 4)]).await.unwrap();
+    assert_eq!(acks[2].missing_below, 1);
+    let r = producer.repair(&g, &format!("{ns}-r"), 1, 4 - acks[2].missing_below, 3, |_| None).await.unwrap();
+    assert_eq!(r, (0, 1));
+    // h: the last events (3, 4) were lost; the high-water announcement reveals them and repair replays them
+    producer.publish(vec![item("h", 1), item("h", 2)]).await.unwrap();
+    let missing = producer.announce(&g, &format!("{ns}-h"), 1, 4).await.unwrap();
+    assert_eq!(missing, 2);
+    let r = producer.repair(&g, &format!("{ns}-h"), 1, 4 - missing + 1, 4, |q| Some(Bytes::from(format!("h/{q}")))).await.unwrap();
+    assert_eq!(r, (2, 0));
+    assert_eq!(producer.announce(&g, &format!("{ns}-h"), 1, 4).await.unwrap(), 0);
+
+    let until = Instant::now() + Duration::from_secs(20);
+    while seen.lock().unwrap().len() < 3 + 4 {
+        assert!(Instant::now() < until, "only {:?}", seen.lock().unwrap());
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let per = |s: &str| -> Vec<(i64, Vec<(i64, i64, i64)>)> {
+        seen.lock().unwrap().iter().filter(|x| x.0 == format!("{ns}-{s}")).map(|x| (x.2, x.3.clone())).collect()
+    };
+    assert_eq!(per("r"), vec![(1, vec![]), (2, vec![]), (4, vec![(1, 3, 3)])]);
+    assert_eq!(per("h"), vec![(1, vec![]), (2, vec![]), (3, vec![]), (4, vec![])]);
+    let _ = stop_tx.send(true);
+    let _ = worker.await;
+}

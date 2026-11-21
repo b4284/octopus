@@ -872,7 +872,7 @@ impl<B: Backend> Dispatcher<B> {
                 bad[i] = true;
                 continue;
             }
-            events.extend(p.items.iter().map(|it| Event {
+            events.extend(p.items.iter().filter(|it| !it.high_water).map(|it| Event {
                 group: it.group.clone(),
                 key: EventKey::new(it.source.clone(), Pos::new(it.epoch, it.seq)),
                 body: if it.skip_to.is_some() { Bytes::new() } else { it.body.clone() },
@@ -881,6 +881,15 @@ impl<B: Backend> Dispatcher<B> {
             }));
         }
         let result = self.backend.publish(&events).await;
+        // high-water announcements: nothing to store, only what is missing up to them
+        let hw_keys: Vec<(String, Pos)> = batch
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| !bad[*i])
+            .flat_map(|(_, p)| p.items.iter().filter(|it| it.high_water).map(|it| (it.source.clone(), Pos::new(it.epoch, it.seq))))
+            .collect();
+        let hw_result = if hw_keys.is_empty() { Ok(vec![]) } else { self.backend.missing_up_to(&hw_keys).await };
+        let mut h = 0;
         self.stats.publish_batches.fetch_add(1, Relaxed);
         let mut stored: HashMap<String, Vec<v1::HintEvent>> = HashMap::new();
         let mut replies: HashMap<String, Vec<v1::Envelope>> = HashMap::new();
@@ -894,15 +903,24 @@ impl<B: Backend> Dispatcher<B> {
                     missing_below: vec![],
                 }
             } else {
-                match &result {
-                    Ok(outcomes) => {
-                        let mine = &outcomes[k..k + p.items.len()];
-                        k += p.items.len();
-                        let missing_below = mine.iter().map(|o| o.missing_below).collect();
-                        let status = mine
-                            .iter()
-                            .zip(&p.items)
-                            .map(|(o, it)| match o.outcome {
+                match (&result, &hw_result) {
+                    (Ok(outcomes), Ok(hw)) => {
+                        let n_store = p.items.iter().filter(|it| !it.high_water).count();
+                        let mine = &outcomes[k..k + n_store];
+                        k += n_store;
+                        let mut outcomes_iter = mine.iter();
+                        let mut missing_below = Vec::with_capacity(p.items.len());
+                        let mut status = Vec::with_capacity(p.items.len());
+                        for it in &p.items {
+                            if it.high_water {
+                                missing_below.push(hw.get(h).copied().unwrap_or(0));
+                                h += 1;
+                                status.push(v1::PublishStatus::PublishHighWater as i32);
+                                continue;
+                            }
+                            let o = outcomes_iter.next().expect("one outcome per stored item");
+                            missing_below.push(o.missing_below);
+                            status.push(match o.outcome {
                                 PublishOutcome::Stored | PublishOutcome::StoredHead => {
                                     let head = o.outcome == PublishOutcome::StoredHead;
                                     let body = if it.skip_to.is_some() {
@@ -942,11 +960,11 @@ impl<B: Backend> Dispatcher<B> {
                                     self.stats.publish_late.fetch_add(1, Relaxed);
                                     v1::PublishStatus::PublishLate as i32
                                 }
-                            })
-                            .collect();
+                            });
+                        }
                         v1::PublishReply { request_id: p.request_id, status, error: String::new(), missing_below }
                     }
-                    Err(e) => v1::PublishReply { request_id: p.request_id, status: vec![], error: e.to_string(), missing_below: vec![] },
+                    (Err(e), _) | (_, Err(e)) => v1::PublishReply { request_id: p.request_id, status: vec![], error: e.to_string(), missing_below: vec![] },
                 }
             };
             if !p.reply_to.is_empty() {

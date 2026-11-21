@@ -165,6 +165,10 @@ duplicate if within that epoch's declared end, otherwise rejected as `STALE_EPOC
 3. every publish reply reports how many positions directly below each event are missing; a producer that lost
    them replays them, or publishes a **skip marker** (`skip_to`: "these positions are lost for good"); a marker is
    never handed out: the cursor jumps over it, the range is recorded as skipped;
+   a producer also announces now and then where a quiet source stands (a **high-water** item: nothing stored, the
+   reply says how many positions up to it are missing), which catches a lost *last* event; the clients' `repair`
+   (Rust) / `RepairAsync` (.NET) does the rest: positions still in flight are left alone, the application's replay
+   function supplies what it can (e.g. from an outbox), every other run gets one skip marker;
 4. the **gap policy** of the group (`grp.gap_skip_ms`, or the dispatchers' default `OCTOPUS_GAP_SKIP_MS`; unset or
    negative = never, alert only): a source stopped longer is moved past the missing positions (within the epoch), or
    its epoch is closed if it has no declared end and a later epoch has events. Only positions not stored at that

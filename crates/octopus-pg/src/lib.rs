@@ -393,6 +393,33 @@ impl Backend for PgBackend {
         Ok(())
     }
 
+    async fn missing_up_to(&self, positions: &[(String, Pos)]) -> Result<Vec<i64>> {
+        if positions.is_empty() {
+            return Ok(vec![]);
+        }
+        let src: Vec<&str> = positions.iter().map(|(s, _)| s.as_str()).collect();
+        let epoch: Vec<i64> = positions.iter().map(|(_, p)| p.epoch).collect();
+        let seq: Vec<i64> = positions.iter().map(|(_, p)| p.seq).collect();
+        let c = self.client().await?;
+        // covered = the highest position of that epoch known stored (or skip-marked) or applied; missing = q - covered.
+        // An epoch older than the cursor's is complete (applied or given up); an unknown source has everything missing.
+        let st = c
+            .prepare_cached(&self.q(
+                "SELECT k.o::int, CASE WHEN s.id IS NULL THEN k.q \
+                        WHEN k.e < s.epoch THEN 0 \
+                        ELSE greatest(0, k.q - greatest( \
+                            CASE WHEN k.e = s.epoch THEN s.last_seq ELSE 0 END, \
+                            (SELECT coalesce(y.skip_to, y.seq) FROM octopus.event y \
+                              WHERE y.sid = s.id AND y.epoch = k.e AND y.seq <= k.q ORDER BY y.seq DESC LIMIT 1), \
+                            0)) END \
+                   FROM unnest($1::text[], $2::bigint[], $3::bigint[]) WITH ORDINALITY AS k(src, e, q, o) \
+                   LEFT JOIN octopus.source s ON s.source = k.src ORDER BY 1",
+            ))
+            .await
+            .map_err(db)?;
+        Ok(c.query(&st, &[&src, &epoch, &seq]).await.map_err(db)?.iter().map(|r| r.get::<_, i64>(1)).collect())
+    }
+
     async fn skip(&self, source: &str, after: Pos, to_seq: Option<i64>, reason: &str) -> Result<Option<(Pos, Skipped)>> {
         let c = self.client().await?;
         let row = c

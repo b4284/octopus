@@ -31,8 +31,66 @@ public sealed class OctopusProducer(OctopusConnection conn)
     public long StuckNow => Interlocked.Read(ref _stuck);
     private long _stuck;
 
+    // positions published by this producer and not acknowledged yet
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<(string, long, long), byte> _inFlight = new();
+
     /// <summary>Publishes and returns one answer per item, in order, once committed.</summary>
     public async Task<IReadOnlyList<PublishAck>> PublishAsync(IReadOnlyList<PublishItem> items, CancellationToken ct = default)
+    {
+        var keys = items.Where(i => !i.HighWater).Select(i => (i.Source, i.Epoch, i.Seq)).ToList();
+        foreach (var k in keys) _inFlight[k] = 0;
+        try { return await PublishOnceAsync(items, ct); }
+        finally { foreach (var k in keys) _inFlight.TryRemove(k, out _); }
+    }
+
+    /// <summary>
+    /// The source's last position is (epoch, seq): returns how many positions directly up to and including it are
+    /// neither stored nor applied (a lost last event shows up here; no later publish would reveal it).
+    /// </summary>
+    public async Task<long> AnnounceAsync(string group, string source, long epoch, long seq, CancellationToken ct = default)
+    {
+        var acks = await PublishAsync([new PublishItem { Group = group, Source = source, Epoch = epoch, Seq = seq, HighWater = true }], ct);
+        return acks.Count > 0 ? acks[0].MissingBelow : 0;
+    }
+
+    /// <summary>
+    /// Repairs positions <paramref name="fromSeq"/>..<paramref name="toSeq"/> of an epoch that Octopus reported
+    /// missing (a <see cref="PublishAck.MissingBelow"/>, or <see cref="AnnounceAsync"/>): positions this producer
+    /// still has in flight are left alone (they arrive on their own); <paramref name="replay"/> supplies the body of
+    /// each other one it can (e.g. from an outbox), and every run it cannot is declared lost with one skip marker.
+    /// Returns (replayed, skipped).
+    /// </summary>
+    public async Task<(long Replayed, long Skipped)> RepairAsync(string group, string source, long epoch, long fromSeq, long toSeq,
+        Func<long, Google.Protobuf.ByteString?> replay, CancellationToken ct = default)
+    {
+        var items = new List<PublishItem>();
+        long replayed = 0, skipped = 0;
+        long? runFrom = null, runTo = null;
+        void Flush()
+        {
+            if (runFrom is null) return;
+            skipped += runTo!.Value - runFrom.Value + 1;
+            items.Add(new PublishItem { Group = group, Source = source, Epoch = epoch, Seq = runFrom.Value, SkipTo = runTo.Value });
+            runFrom = runTo = null;
+        }
+        for (long q = fromSeq; q <= toSeq; q++)
+        {
+            if (_inFlight.ContainsKey((source, epoch, q))) { Flush(); continue; }
+            var body = replay(q);
+            if (body is not null)
+            {
+                Flush();
+                replayed++;
+                items.Add(new PublishItem { Group = group, Source = source, Epoch = epoch, Seq = q, Body = body });
+            }
+            else { runFrom ??= q; runTo = q; }
+        }
+        Flush();
+        if (items.Count > 0) await PublishAsync(items, ct);
+        return (replayed, skipped);
+    }
+
+    private async Task<IReadOnlyList<PublishAck>> PublishOnceAsync(IReadOnlyList<PublishItem> items, CancellationToken ct)
     {
         if (items.Count == 0) return [];
         var req = new PublishRequest { ReplyTo = conn.Inbox };

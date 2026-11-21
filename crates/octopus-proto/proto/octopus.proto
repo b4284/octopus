@@ -48,6 +48,12 @@ message PublishItem {
   // is closed after the gap timeout.
   optional int64 prev_epoch = 7;
   optional int64 prev_last_seq = 8;
+  // A high-water announcement (body ignored, nothing stored): the source's last position is (epoch, seq). The reply
+  // (PUBLISH_HIGH_WATER) says in missing_below how many positions directly up to and including it (the run ending
+  // at it) are neither stored nor
+  // applied: it catches a lost last event, which no later publish would reveal. Producers send it now and then
+  // for sources that went quiet.
+  bool high_water = 9;
 }
 
 enum PublishStatus {
@@ -59,6 +65,7 @@ enum PublishStatus {
   PUBLISH_STALE_EPOCH = 5;        // an epoch older than the source's current one, beyond its declared end: rejected
                                   // (a stale producer instance)
   PUBLISH_LATE = 6;               // its position was skipped before it arrived: not handed out, kept for audit
+  PUBLISH_HIGH_WATER = 7;         // a high-water announcement was checked (see missing_below)
 }
 
 message PublishReply {

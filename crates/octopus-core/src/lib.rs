@@ -248,6 +248,11 @@ pub trait Backend: Send + Sync + 'static {
     /// Every unexpired lease, with its owner's address.
     fn leases(&self) -> impl Future<Output = Result<Vec<(Lease, String)>>> + Send;
 
+    /// For each (source, position): how many positions of that epoch directly up to and including it (the run ending at
+    /// it) are neither stored nor
+    /// applied (a high-water check: catches a lost last event).
+    fn missing_up_to(&self, positions: &[(String, Pos)]) -> impl Future<Output = Result<Vec<i64>>> + Send;
+
     /// Give up positions of a source that is stopped by a missing event, if its cursor is still `after` (otherwise
     /// nothing changes and None is returned: someone moved it meanwhile). `to_seq` Some: skip `after.seq + 1 ..=
     /// to_seq` in the cursor's epoch. None: close the cursor's epoch where it stands and move on to the next stored
