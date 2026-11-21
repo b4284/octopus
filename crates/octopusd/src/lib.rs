@@ -114,6 +114,8 @@ struct GroupState {
     dirty: bool,
     fetching: bool,
     last_fetch: Option<Instant>,
+    /// why the current head read was started (0 dirty, 1 fallback timer, 2 zero-credit probe): statistics only
+    fetch_why: usize,
     /// Events this dispatcher handed out whose outcome is unknown (timed out, or "done" hit a database error):
     /// a repeat must carry possibly_redelivered.
     suspect: HashSet<(String, Pos)>,
@@ -186,7 +188,7 @@ impl GroupState {
         let c = self.cursor.entry(source.to_owned()).or_default();
         *c = (*c).max(pos);
         let Some(p) = self.pending.get_mut(source) else {
-            self.want.insert(source.to_owned(), pos.next());
+            self.want_if_stored(source, pos.next());
             return false;
         };
         // forget what is done, then take the next one if we hold it
@@ -210,9 +212,18 @@ impl GroupState {
         match next {
             Some(h) => self.offer(h),
             None => {
-                self.want.insert(source.to_owned(), pos.next());
+                self.want_if_stored(source, pos.next());
                 false
             }
+        }
+    }
+
+    /// Look up `pos` by key only if an event at or beyond it is known to be stored. Otherwise it is (almost always)
+    /// not published yet: its publish hint offers it when it arrives (the in-memory cursor makes it the head), and
+    /// the fallback head read catches a lost hint. (Unconditional lookups found an event 1% of the time: matrix-24.)
+    fn want_if_stored(&mut self, source: &str, pos: Pos) {
+        if self.known_max.get(source).is_some_and(|m| *m >= pos) {
+            self.want.insert(source.to_owned(), pos);
         }
     }
 
@@ -474,6 +485,7 @@ impl Core {
                 if want == 0 && st.ready.is_empty() && st.last_probe.is_none_or(|t| now.duration_since(t) >= PROBE_EVERY) {
                     st.last_probe = Some(now);
                     st.fetching = true;
+                    st.fetch_why = 2;
                     st.dirty = false;
                     let exclude = st.inflight.keys().cloned().collect();
                     reqs.push(HeadRequest { group: g.clone(), max: 1, exclude_sources: exclude });
@@ -484,6 +496,7 @@ impl Core {
                 continue;
             }
             st.fetching = true;
+            st.fetch_why = if st.dirty { 0 } else { 1 };
             st.dirty = false;
             let exclude = st.inflight.keys().cloned().chain(st.ready.iter().map(|r| r.head.key.source.clone())).collect();
             reqs.push(HeadRequest { group: g.clone(), max: want - st.ready.len(), exclude_sources: exclude });
@@ -516,6 +529,12 @@ pub struct Stats {
     pub delivered: AtomicU64,
     pub fetches: AtomicU64,
     pub fetched_heads: AtomicU64,
+    /// group head reads by reason (dirty, fallback timer, zero-credit probe), and how many of them found an event
+    pub group_reads: [AtomicU64; 3],
+    pub group_reads_found: [AtomicU64; 3],
+    /// lookups of specific events by key (a source's next event after a "done"), and events found
+    pub key_fetches: AtomicU64,
+    pub key_found: AtomicU64,
     pub timeouts: AtomicU64,
     /// failure reports from a worker that no longer holds the event (ignored)
     pub stale_failures: AtomicU64,
@@ -1289,6 +1308,11 @@ impl<B: Backend> Dispatcher<B> {
             }
             for r in &reqs {
                 if let Some(st) = core.groups.get_mut(&r.group) {
+                    let why = st.fetch_why.min(2);
+                    self.stats.group_reads[why].fetch_add(1, Relaxed);
+                    if got.get(&r.group).copied().unwrap_or(0) > 0 {
+                        self.stats.group_reads_found[why].fetch_add(1, Relaxed);
+                    }
                     st.fetching = false;
                     st.last_fetch = Some(now);
                     if result.is_err() || got.get(&r.group).copied().unwrap_or(0) >= r.max {
@@ -1325,6 +1349,10 @@ impl<B: Backend> Dispatcher<B> {
         let groups: HashSet<String> = keys.iter().map(|(g, _)| g.clone()).collect();
         let list: Vec<EventKey> = keys.iter().map(|(_, k)| k.clone()).collect();
         let result = self.backend.read_events(&list).await;
+        self.stats.key_fetches.fetch_add(list.len() as u64, Relaxed);
+        if let Ok(found) = &result {
+            self.stats.key_found.fetch_add(found.len() as u64, Relaxed);
+        }
         let now = Instant::now();
         let sends = {
             let mut core = self.core.lock().unwrap();
@@ -1751,7 +1779,11 @@ impl<B: Backend> Dispatcher<B> {
                 timeouts = s.timeouts.load(Relaxed), stale_failures = s.stale_failures.load(Relaxed), gaps_open = s.gaps_open.load(Relaxed),
                 publish_conflicts = s.publish_conflicts.load(Relaxed), publish_stale_epoch = s.publish_stale_epoch.load(Relaxed),
                 publish_late = s.publish_late.load(Relaxed), skips, commit_batches = s.commit_batches.load(Relaxed),
-                fetches = s.fetches.load(Relaxed), "stats"
+                fetches = s.fetches.load(Relaxed),
+                reads_dirty = s.group_reads[0].load(Relaxed), found_dirty = s.group_reads_found[0].load(Relaxed),
+                reads_fallback = s.group_reads[1].load(Relaxed), found_fallback = s.group_reads_found[1].load(Relaxed),
+                reads_probe = s.group_reads[2].load(Relaxed), found_probe = s.group_reads_found[2].load(Relaxed),
+                key_fetches = s.key_fetches.load(Relaxed), key_found = s.key_found.load(Relaxed), "stats"
             );
         }
     }
