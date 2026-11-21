@@ -1,7 +1,7 @@
 [package]
 name = "octopus-fabric"
 version = "0.1.0"
-description = "Pub/sub transport for Octopus (MQTT 5 first; Solace speaks MQTT natively)"
+description = "Pub/sub transport for Octopus: MQTT 5 or NATS"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -10,6 +10,8 @@ rust-version.workspace = true
 [dependencies]
 bytes.workspace = true
 rumqttc = "0.25.1"
+async-nats = "0.52.0"
+futures-util = "0.3"
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true

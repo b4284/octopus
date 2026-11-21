@@ -1,6 +1,12 @@
-//! The pub/sub fabric Octopus runs over. MQTT 5 is the first binding: Solace PubSub+ speaks it natively, and
-//! Mosquitto or EMQX run it in a container for tests. Other bindings (Solace's native API, AMQP 1.0) implement the
-//! same small surface: publish, subscribe, and a stream of incoming messages.
+//! The pub/sub fabric Octopus runs over: MQTT 5 (Solace PubSub+ speaks it natively; Mosquitto or EMQX in a container
+//! for tests) or NATS. Both implement the same small surface: publish, subscribe, and a stream of incoming messages.
+//! Topics are MQTT-style everywhere (`ns/kind/name`, filters with `+` and `#`, `$share/<name>/...` for a shared
+//! subscription); the NATS binding maps them to subjects (`/` -> `.`, `+` -> `*`, `#` -> `>`, a shared subscription
+//! -> a queue group) and percent-encodes the characters NATS reserves inside a segment.
+//!
+//! NATS has neither retained messages nor a last will: a retained publish is a plain publish (Octopus re-announces
+//! members and owners every 5 s, so a newcomer waits at most that long), and a dispatcher that dies without saying so
+//! is noticed through lease expiry and worker timeouts.
 //!
 //! The fabric is never the durability point: callers treat every message as possibly lost, repeated or
 //! reordered.
@@ -68,12 +74,97 @@ impl MqttConfig {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct NatsConfig {
+    /// e.g. `nats://127.0.0.1:4222` (several servers: comma-separated)
+    pub url: String,
+    pub name: String,
+    pub username: Option<String>,
+    pub password: Option<String>,
+    /// Capacity of the incoming channel (and of each subscription's buffer).
+    pub capacity: usize,
+}
+
+impl NatsConfig {
+    pub fn new(url: impl Into<String>, name: impl Into<String>) -> Self {
+        Self { url: url.into(), name: name.into(), username: None, password: None, capacity: 65_536 }
+    }
+}
+
 /// Handle for publishing and subscribing; cheap to clone.
 #[derive(Clone)]
 pub struct Fabric {
-    client: AsyncClient,
-    qos: QoS,
+    inner: Inner,
     subscriptions: Arc<Mutex<BTreeSet<String>>>,
+}
+
+#[derive(Clone)]
+enum Inner {
+    Mqtt { client: AsyncClient, qos: QoS },
+    Nats { client: async_nats::Client, tx: mpsc::Sender<Incoming> },
+}
+
+/// One topic segment as a NATS subject token: the characters NATS reserves are percent-encoded.
+fn nats_token(seg: &str) -> String {
+    let mut out = String::with_capacity(seg.len());
+    for c in seg.chars() {
+        match c {
+            '%' => out.push_str("%25"),
+            '.' => out.push_str("%2E"),
+            '*' => out.push_str("%2A"),
+            '>' => out.push_str("%3E"),
+            ' ' => out.push_str("%20"),
+            '\t' => out.push_str("%09"),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// An MQTT topic or filter as a NATS subject (wildcards mapped), and the queue group of a shared subscription.
+fn nats_subject(topic: &str) -> (String, Option<String>) {
+    let (queue, rest) = match topic.strip_prefix("$share/").and_then(|r| r.split_once('/')) {
+        Some((q, rest)) => (Some(q.to_owned()), rest),
+        None => (None, topic),
+    };
+    let subject = rest
+        .split('/')
+        .map(|seg| match seg {
+            "+" => "*".to_owned(),
+            "#" => ">".to_owned(),
+            s => nats_token(s),
+        })
+        .collect::<Vec<_>>()
+        .join(".");
+    (subject, queue)
+}
+
+/// A NATS subject back as an MQTT-style topic.
+fn mqtt_topic(subject: &str) -> String {
+    subject
+        .split('.')
+        .map(|t| {
+            if !t.contains('%') {
+                return t.to_owned();
+            }
+            let b = t.as_bytes();
+            let mut out = Vec::with_capacity(b.len());
+            let mut i = 0;
+            while i < b.len() {
+                if b[i] == b'%' && i + 2 < b.len() {
+                    if let Ok(v) = u8::from_str_radix(&t[i + 1..i + 3], 16) {
+                        out.push(v);
+                        i += 3;
+                        continue;
+                    }
+                }
+                out.push(b[i]);
+                i += 1;
+            }
+            String::from_utf8_lossy(&out).into_owned()
+        })
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 fn qos(q: u8) -> QoS {
@@ -103,9 +194,9 @@ impl Fabric {
         }
         let (client, mut eventloop) = AsyncClient::new(opts, cfg.capacity);
         let (tx, rx) = mpsc::channel(cfg.capacity);
-        let fabric = Fabric { client: client.clone(), qos: qos(cfg.qos), subscriptions: Arc::new(Mutex::new(BTreeSet::new())) };
+        let q = qos(cfg.qos);
+        let fabric = Fabric { inner: Inner::Mqtt { client: client.clone(), qos: q }, subscriptions: Arc::new(Mutex::new(BTreeSet::new())) };
         let subs = fabric.subscriptions.clone();
-        let q = fabric.qos;
         let id = cfg.client_id.clone();
         tokio::spawn(async move {
             let mut connected = false;
@@ -147,22 +238,96 @@ impl Fabric {
         (fabric, rx)
     }
 
-    pub async fn publish(&self, topic: impl Into<String>, payload: Bytes) -> Result<()> {
-        self.client.publish(topic, self.qos, false, payload).await.map_err(|e| Error::Fabric(e.to_string()))
+    /// Connects to NATS (reconnecting for ever in the background; the first connect too) and returns the handle and
+    /// the incoming messages. The last will of an MQTT connection has no NATS counterpart (see the module docs).
+    pub async fn connect_nats(cfg: NatsConfig) -> Result<(Fabric, mpsc::Receiver<Incoming>)> {
+        let mut opts = async_nats::ConnectOptions::new()
+            .name(cfg.name.clone())
+            .retry_on_initial_connect()
+            .max_reconnects(None)
+            .subscription_capacity(cfg.capacity)
+            .event_callback(|e| async move { info!(event = %e, "nats") });
+        if let (Some(u), Some(p)) = (cfg.username.clone(), cfg.password.clone()) {
+            opts = opts.user_and_password(u, p);
+        }
+        let client = opts.connect(cfg.url.as_str()).await.map_err(|e| Error::Fabric(e.to_string()))?;
+        let (tx, rx) = mpsc::channel(cfg.capacity);
+        Ok((Fabric { inner: Inner::Nats { client, tx }, subscriptions: Arc::new(Mutex::new(BTreeSet::new())) }, rx))
     }
 
+    pub async fn publish(&self, topic: impl Into<String>, payload: Bytes) -> Result<()> {
+        match &self.inner {
+            Inner::Mqtt { client, qos } => client.publish(topic, *qos, false, payload).await.map_err(|e| Error::Fabric(e.to_string())),
+            Inner::Nats { client, .. } => {
+                let (subject, _) = nats_subject(&topic.into());
+                client.publish(subject, payload).await.map_err(|e| Error::Fabric(e.to_string()))
+            }
+        }
+    }
+
+    /// A retained publish on MQTT; a plain one on NATS (no retained messages: see the module docs).
     pub async fn publish_retained(&self, topic: impl Into<String>, payload: Bytes) -> Result<()> {
-        self.client.publish(topic, self.qos, true, payload).await.map_err(|e| Error::Fabric(e.to_string()))
+        match &self.inner {
+            Inner::Mqtt { client, qos } => client.publish(topic, *qos, true, payload).await.map_err(|e| Error::Fabric(e.to_string())),
+            Inner::Nats { .. } => self.publish(topic, payload).await,
+        }
     }
 
     /// Subscribes now and again after every reconnect.
     pub async fn subscribe(&self, filter: impl Into<String>) -> Result<()> {
         let f = filter.into();
-        self.subscriptions.lock().unwrap().insert(f.clone());
-        self.client.subscribe(f, self.qos).await.map_err(|e| Error::Fabric(e.to_string()))
+        if !self.subscriptions.lock().unwrap().insert(f.clone()) {
+            if matches!(self.inner, Inner::Nats { .. }) {
+                return Ok(()); // already subscribed (NATS keeps subscriptions across reconnects)
+            }
+        }
+        match &self.inner {
+            Inner::Mqtt { client, qos } => client.subscribe(f, *qos).await.map_err(|e| Error::Fabric(e.to_string())),
+            Inner::Nats { client, tx } => {
+                let (subject, queue) = nats_subject(&f);
+                let mut sub = match queue {
+                    Some(q) => client.queue_subscribe(subject, q).await,
+                    None => client.subscribe(subject).await,
+                }
+                .map_err(|e| Error::Fabric(e.to_string()))?;
+                let tx = tx.clone();
+                tokio::spawn(async move {
+                    use futures_util::StreamExt;
+                    while let Some(m) = sub.next().await {
+                        if tx.send(Incoming { topic: mqtt_topic(m.subject.as_str()), payload: m.payload }).await.is_err() {
+                            return; // receiver dropped: shut down
+                        }
+                    }
+                });
+                Ok(())
+            }
+        }
     }
 
     pub async fn disconnect(&self) {
-        let _ = self.client.disconnect().await;
+        match &self.inner {
+            Inner::Mqtt { client, .. } => {
+                let _ = client.disconnect().await;
+            }
+            Inner::Nats { client, .. } => {
+                let _ = client.flush().await;
+                let _ = client.drain().await;
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn topics_map_to_subjects_and_back() {
+        assert_eq!(nats_subject("octopus/pub/g1"), ("octopus.pub.g1".into(), None));
+        assert_eq!(nats_subject("$share/octopusd/octopus/pub/+"), ("octopus.pub.*".into(), Some("octopusd".into())));
+        assert_eq!(nats_subject("octopus/member/#"), ("octopus.member.>".into(), None));
+        assert_eq!(nats_subject("octopus/inbox/a.b c*d>e%f").0, "octopus.inbox.a%2Eb%20c%2Ad%3Ee%25f");
+        assert_eq!(mqtt_topic("octopus.inbox.a%2Eb%20c%2Ad%3Ee%25f"), "octopus/inbox/a.b c*d>e%f");
+        assert_eq!(mqtt_topic("octopus.owner.g7"), "octopus/owner/g7");
     }
 }

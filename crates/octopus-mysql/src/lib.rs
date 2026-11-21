@@ -143,7 +143,9 @@ impl MysqlBackend {
             return Err(Error::Config(format!("table prefix {:?}: use [a-z0-9_]", cfg.prefix)));
         }
         let opts = Opts::from_url(&cfg.connection).map_err(|e| Error::Config(format!("connection: {e}")))?;
-        let constraints = PoolConstraints::new(1, cfg.pool_size.max(1)).expect("pool constraints");
+        // min = max: mysql_async closes idle connections above the minimum at once (inactive_connection_ttl defaults
+        // to zero), which under load meant a new connection per operation (matrix-31: ~34k connection setups per run)
+        let constraints = PoolConstraints::new(cfg.pool_size.max(1), cfg.pool_size.max(1)).expect("pool constraints");
         let opts = OptsBuilder::from_opts(opts)
             // no COM_RESET_CONNECTION when a connection goes back to the pool: it would drop the procedures'
             // per-session scratch tables and re-run the session setup on every operation (matrix-31: ~70
