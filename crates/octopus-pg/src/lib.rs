@@ -213,10 +213,19 @@ impl Backend for PgBackend {
             .prepare_cached(&self.q("SELECT codes, missing FROM octopus.publish($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)"))
             .await
             .map_err(db)?;
-        let row = c
-            .query_one(&st, &[&grp, &src, &epoch, &seq, &body, &hash, &skip_to, &prev_epoch, &prev_last, &all_known])
-            .await
-            .map_err(db)?;
+        let row = match c.query_one(&st, &[&grp, &src, &epoch, &seq, &body, &hash, &skip_to, &prev_epoch, &prev_last, &all_known]).await {
+            // a source the cache believed registered is not there: forget the batch's sources, retry with registration
+            Err(e) if e.as_db_error().is_some_and(|d| d.message().contains("unknown source in publish batch")) => {
+                {
+                    let mut k = self.known.lock().unwrap();
+                    for e in events {
+                        k.remove(&e.key.source);
+                    }
+                }
+                c.query_one(&st, &[&grp, &src, &epoch, &seq, &body, &hash, &skip_to, &prev_epoch, &prev_last, &false]).await.map_err(db)?
+            }
+            r => r.map_err(db)?,
+        };
         let codes: Vec<i16> = row.get(0);
         let missing: Vec<i64> = row.get(1);
         if !all_known {

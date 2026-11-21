@@ -3,6 +3,7 @@ using System.Collections.Concurrent;
 using Google.Protobuf;
 using MQTTnet;
 using MQTTnet.Protocol;
+using NATS.Client.Core;
 using Octopus.V1;
 
 namespace Octopus.Client;
@@ -27,6 +28,40 @@ public sealed class OctopusOptions
     /// destination to 1/Linger at an added latency of at most Linger.
     /// </summary>
     public TimeSpan Linger { get; set; } = TimeSpan.FromMilliseconds(2);
+    /// <summary>"mqtt" (default) or "nats". With NATS, Host/Port name the NATS server (default port 4222).</summary>
+    public string Transport { get; set; } = "mqtt";
+}
+
+/// <summary>
+/// MQTT-style topics as NATS subjects, as in the Rust fabric: '/' -> '.', '+' -> '*', '#' -> '>', a shared
+/// subscription ($share/name/...) -> a queue group, and the characters NATS reserves inside a segment percent-encoded.
+/// </summary>
+internal static class NatsSubjects
+{
+    public static (string Subject, string? Queue) Of(string topic)
+    {
+        string? queue = null;
+        var rest = topic;
+        if (topic.StartsWith("$share/", StringComparison.Ordinal))
+        {
+            int slash = topic.IndexOf('/', 7);
+            if (slash > 0) { queue = topic[7..slash]; rest = topic[(slash + 1)..]; }
+        }
+        var parts = rest.Split('/').Select(seg => seg switch { "+" => "*", "#" => ">", _ => Encode(seg) });
+        return (string.Join('.', parts), queue);
+    }
+
+    private static string Encode(string seg)
+    {
+        if (seg.IndexOfAny(['%', '.', '*', '>', ' ', '\t']) < 0) return seg;
+        var b = new System.Text.StringBuilder(seg.Length + 8);
+        foreach (var c in seg)
+            b.Append(c switch { '%' => "%25", '.' => "%2E", '*' => "%2A", '>' => "%3E", ' ' => "%20", '\t' => "%09", _ => c.ToString() });
+        return b.ToString();
+    }
+
+    public static string Topic(string subject) =>
+        string.Join('/', subject.Split('.').Select(t => t.Contains('%') ? Uri.UnescapeDataString(t) : t));
 }
 
 /// <summary>Topic layout (see octopus.proto).</summary>
@@ -49,8 +84,9 @@ public sealed class Topics(string ns)
 public sealed class OctopusConnection : IAsyncDisposable
 {
     private readonly OctopusOptions _o;
-    private readonly IMqttClient _client;
-    private readonly MqttClientOptions _options;
+    private readonly IMqttClient? _client;
+    private readonly MqttClientOptions? _options;
+    private readonly NatsConnection? _nats;
     private readonly ConcurrentDictionary<string, byte> _filters = new();
     private readonly ConcurrentDictionary<string, Outbox> _outboxes = new();
     private readonly CancellationTokenSource _cts = new();
@@ -79,6 +115,21 @@ public sealed class OctopusConnection : IAsyncDisposable
         Topics = new Topics(o.Namespace);
         Inbox = Topics.Inbox(o.ClientId);
         _qos = o.QoS == 0 ? MqttQualityOfServiceLevel.AtMostOnce : MqttQualityOfServiceLevel.AtLeastOnce;
+        if (o.Transport.Equals("nats", StringComparison.OrdinalIgnoreCase))
+        {
+            int port = o.Port == 1883 ? 4222 : o.Port;
+            var nopts = NatsOpts.Default with
+            {
+                Url = $"nats://{o.Host}:{port}",
+                Name = o.ClientId,
+                AuthOpts = o.Username != null ? NatsAuthOpts.Default with { Username = o.Username, Password = o.Password } : NatsAuthOpts.Default,
+                SubPendingChannelCapacity = 65536,
+                SubPendingChannelFullMode = System.Threading.Channels.BoundedChannelFullMode.Wait,
+                MaxReconnectRetry = -1,
+            };
+            _nats = new NatsConnection(nopts);
+            return;
+        }
         _client = new MqttClientFactory().CreateMqttClient();
         var b = new MqttClientOptionsBuilder()
             .WithTcpServer(o.Host, o.Port)
@@ -95,7 +146,7 @@ public sealed class OctopusConnection : IAsyncDisposable
             // MQTTnet's default 8 KB socket buffer makes large sends superlinear (5 MB: 2.8 s); 1 MB: ~4 ms.
             tcp.BufferSize = 1 << 20;
         }
-        _client.ApplicationMessageReceivedAsync += e =>
+        _client!.ApplicationMessageReceivedAsync += e =>
         {
             Interlocked.Increment(ref Received);
             OnMessage(e.ApplicationMessage.Topic, e.ApplicationMessage.Payload);
@@ -111,7 +162,8 @@ public sealed class OctopusConnection : IAsyncDisposable
     public static async Task<OctopusConnection> ConnectAsync(OctopusOptions o, CancellationToken ct = default)
     {
         var c = new OctopusConnection(o);
-        await c._client.ConnectAsync(c._options, ct);
+        if (c._nats != null) await c._nats.ConnectAsync();
+        else await c._client!.ConnectAsync(c._options!, ct);
         await c.SubscribeAsync(c.Inbox, ct);
         await c.SubscribeAsync(c.Topics.MembersFilter, ct);
         await c.SubscribeAsync(c.Topics.OwnersFilter, ct);
@@ -125,11 +177,11 @@ public sealed class OctopusConnection : IAsyncDisposable
         if (Interlocked.Exchange(ref _reconnecting, 1) == 1) return;
         try
         {
-            while (!_cts.IsCancellationRequested && !_client.IsConnected)
+            while (!_cts.IsCancellationRequested && _client != null && !_client.IsConnected)
             {
                 try
                 {
-                    await _client.ConnectAsync(_options, _cts.Token);
+                    await _client.ConnectAsync(_options!, _cts.Token);
                     foreach (var f in _filters.Keys)
                         await _client.SubscribeAsync(new MqttClientSubscribeOptionsBuilder().WithTopicFilter(f, _qos).Build(), _cts.Token);
                 }
@@ -145,8 +197,26 @@ public sealed class OctopusConnection : IAsyncDisposable
 
     public async Task SubscribeAsync(string filter, CancellationToken ct = default)
     {
-        _filters[filter] = 0;
-        await _client.SubscribeAsync(new MqttClientSubscribeOptionsBuilder().WithTopicFilter(filter, _qos).Build(), ct);
+        if (!_filters.TryAdd(filter, 0) && _nats != null) return; // NATS keeps subscriptions across reconnects
+        if (_nats != null)
+        {
+            var (subject, queue) = NatsSubjects.Of(filter);
+            var sub = await _nats.SubscribeCoreAsync<byte[]>(subject, queueGroup: queue, cancellationToken: _cts.Token);
+            _ = Task.Run(async () =>
+            {
+                try
+                {
+                    await foreach (var m in sub.Msgs.ReadAllAsync(_cts.Token))
+                    {
+                        Interlocked.Increment(ref Received);
+                        OnMessage(NatsSubjects.Topic(m.Subject), new ReadOnlySequence<byte>(m.Data ?? []));
+                    }
+                }
+                catch (OperationCanceledException) { }
+            });
+            return;
+        }
+        await _client!.SubscribeAsync(new MqttClientSubscribeOptionsBuilder().WithTopicFilter(filter, _qos).Build(), ct);
     }
 
     // ---- outgoing: coalesced per topic ----
@@ -164,9 +234,14 @@ public sealed class OctopusConnection : IAsyncDisposable
 
     private async Task PublishRawAsync(string topic, byte[] payload)
     {
-        var msg = new MqttApplicationMessageBuilder().WithTopic(topic).WithPayload(payload).WithQualityOfServiceLevel(_qos).Build();
         Interlocked.Increment(ref Sent);
-        await _client.PublishAsync(msg, _cts.Token);
+        if (_nats != null)
+        {
+            await _nats.PublishAsync(NatsSubjects.Of(topic).Subject, payload, cancellationToken: _cts.Token);
+            return;
+        }
+        var msg = new MqttApplicationMessageBuilder().WithTopic(topic).WithPayload(payload).WithQualityOfServiceLevel(_qos).Build();
+        await _client!.PublishAsync(msg, _cts.Token);
     }
 
     /// <summary>One destination: a queue and at most one send in progress.</summary>
@@ -292,7 +367,12 @@ public sealed class OctopusConnection : IAsyncDisposable
     public async ValueTask DisposeAsync()
     {
         _cts.Cancel();
-        try { await _client.DisconnectAsync(); } catch { /* closing */ }
-        _client.Dispose();
+        if (_nats != null)
+        {
+            try { await _nats.DisposeAsync(); } catch { /* closing */ }
+            return;
+        }
+        try { await _client!.DisconnectAsync(); } catch { /* closing */ }
+        _client!.Dispose();
     }
 }

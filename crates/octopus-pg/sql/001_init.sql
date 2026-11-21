@@ -236,6 +236,11 @@ BEGIN
     SELECT array_agg(code::smallint ORDER BY i), array_agg(CASE WHEN code IN (0, 1, 3) THEN miss ELSE 0 END ORDER BY i)
       INTO codes, missing
       FROM st;
+    -- Never acknowledge an event that was not processed: a source not found (the caller believed it registered) leaves
+    -- the batch short; abort (rolling back its inserts), and the caller retries with registration.
+    IF coalesce(array_length(codes, 1), 0) <> coalesce(array_length(p_source, 1), 0) THEN
+        RAISE EXCEPTION 'octopus: unknown source in publish batch';
+    END IF;
 END $$;
 
 -- Commit (apply-hook mode): one transaction for a batch. Locks the cursors in source order (no deadlocks between

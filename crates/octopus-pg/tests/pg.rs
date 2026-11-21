@@ -474,3 +474,16 @@ async fn a_skip_never_gives_up_an_event_stored_meanwhile() {
     assert_eq!(r, Some((p(3), Skipped { epoch: E, from_seq: 3, to_seq: Some(3) })));
     assert_eq!(heads_of(&b, &g).await, vec![key(&s, 4)]);
 }
+
+#[tokio::test]
+async fn a_source_believed_registered_but_missing_is_registered_not_acknowledged() {
+    let b = backend().await;
+    let (g, s) = (uniq("g-stale"), uniq("s-stale"));
+    b.publish(&[ev(&g, &s, 1, "a")]).await.unwrap(); // registers the source; the backend now believes it known
+    let (client, conn) = tokio_postgres::connect(&conn_str(), tokio_postgres::NoTls).await.unwrap();
+    tokio::spawn(conn);
+    client.execute("DELETE FROM octopus.event e USING octopus.source s WHERE s.id = e.sid AND s.source = $1", &[&s]).await.unwrap();
+    client.execute("DELETE FROM octopus.source WHERE source = $1", &[&s]).await.unwrap();
+    // the event must be stored (and the source registered again), never acknowledged as a duplicate
+    assert_eq!(outcomes(&b, &[ev(&g, &s, 1, "a")]).await, vec![PublishOutcome::StoredHead]);
+}

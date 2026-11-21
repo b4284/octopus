@@ -372,7 +372,19 @@ impl Backend for MssqlBackend {
             events.iter().all(|e| k.contains(&e.key.source) && k.contains(&format!("\u{1}{}", e.group)))
         };
         let j = json(&items);
-        let rows = self.rows(&self.q("EXEC octopus.publish @P1, @P2"), &[&j.as_str(), &all_known]).await?;
+        let rows = match self.rows(&self.q("EXEC octopus.publish @P1, @P2"), &[&j.as_str(), &all_known]).await {
+            // a source the cache believed registered is not there: forget the batch's sources, retry with registration
+            Err(Error::Database(m)) if m.contains("unknown source in publish batch") => {
+                {
+                    let mut k = self.known.lock().unwrap();
+                    for e in events {
+                        k.remove(&e.key.source);
+                    }
+                }
+                self.rows(&self.q("EXEC octopus.publish @P1, @P2"), &[&j.as_str(), &false]).await?
+            }
+            r => r?,
+        };
         if !all_known {
             let mut k = self.known.lock().unwrap();
             if k.len() > KNOWN_MAX {

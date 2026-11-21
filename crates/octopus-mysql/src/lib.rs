@@ -62,6 +62,8 @@ pub struct MysqlBackend {
     apply_hook: Option<String>,
     load_hook: Option<String>,
     deadlocks: std::sync::atomic::AtomicU64,
+    /// publish batches retried because a source believed registered was not found
+    unknown_retries: std::sync::atomic::AtomicU64,
 }
 
 const KNOWN_MAX: usize = 1_000_000;
@@ -164,6 +166,7 @@ impl MysqlBackend {
             apply_hook: cfg.apply_hook,
             load_hook: cfg.load_hook,
             deadlocks: Default::default(),
+            unknown_retries: Default::default(),
         };
         if cfg.migrate {
             b.migrate().await?;
@@ -188,6 +191,11 @@ impl MysqlBackend {
     /// Deadlock victims retried so far (statistics).
     pub fn deadlocks(&self) -> u64 {
         self.deadlocks.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Publish batches retried because a source believed registered was not found (statistics).
+    pub fn unknown_retries(&self) -> u64 {
+        self.unknown_retries.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Runs the schema script when the installed version differs from this build's (hash in <prefix>meta), one
@@ -300,7 +308,22 @@ impl Backend for MysqlBackend {
             events.iter().all(|e| k.contains(&e.key.source) && k.contains(&format!("\u{1}{}", e.group)))
         };
         let j = serde_json::to_string(&items).unwrap();
-        let rows = self.rows(&self.q("CALL octopus_publish(?, ?)"), (j, all_known as i64)).await?;
+        let rows = match self.rows(&self.q("CALL octopus_publish(?, ?)"), (j.clone(), all_known as i64)).await {
+            // a source the cache believed registered is not there (or not visible yet): forget the batch's sources
+            // and retry once with registration
+            Err(Error::Database(m)) if m.contains("unknown source in publish batch") => {
+                let n = self.unknown_retries.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                tracing::warn!(retries = n, events = events.len(), "publish: a source believed registered was not found; retrying with registration");
+                {
+                    let mut k = self.known.lock().unwrap();
+                    for e in events {
+                        k.remove(&e.key.source);
+                    }
+                }
+                self.rows(&self.q("CALL octopus_publish(?, ?)"), (j, 0i64)).await?
+            }
+            r => r?,
+        };
         if !all_known {
             let mut k = self.known.lock().unwrap();
             if k.len() > KNOWN_MAX {

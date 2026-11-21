@@ -224,6 +224,13 @@ BEGIN
            MAX(COALESCE(u.k, u.q)) OVER (PARTITION BY src.id, u.e ORDER BY u.q ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING)
       FROM @u u JOIN octopus.source src WITH (FORCESEEK) ON src.source = u.s
     OPTION (LOOP JOIN);
+    -- Never acknowledge an event that was not processed: a source not found here aborts the batch; the caller retries
+    -- with registration (reporting such events as duplicates lost them on MySQL, matrix-31).
+    IF (SELECT COUNT(*) FROM @x) < (SELECT COUNT(*) FROM @u)
+    BEGIN
+        ROLLBACK;
+        THROW 50002, 'octopus: unknown source in publish batch', 1;
+    END;
     DECLARE @ins TABLE (sid bigint, epoch bigint, seq bigint, PRIMARY KEY (sid, epoch, seq));
     -- (rows already stored, by this or a concurrent publish, are ignored by the key and not in the output)
     INSERT INTO octopus.event (sid, epoch, seq, grp, body, body_hash, skip_to)
@@ -263,7 +270,6 @@ BEGIN
         INSERT INTO octopus.late (sid, epoch, seq, body)
         SELECT st.sid, st.e, st.q, u.b FROM @st st JOIN @u u ON u.i = st.i WHERE st.code = 6;
     COMMIT;
-    -- events of a source unknown here (registration failed) are reported as duplicates (code 1), as in PostgreSQL
     SELECT u.i, COALESCE(st.code, CAST(1 AS smallint)) AS code,
            CASE WHEN st.code IN (0, 1, 3) THEN st.miss ELSE 0 END AS missing
       FROM @u u LEFT JOIN @st st ON st.i = u.i

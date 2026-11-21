@@ -194,6 +194,13 @@ BEGIN
            (y.sid IS NOT NULL), y.body_hash
       FROM octopus_tmp_u u JOIN octopus_source src ON src.source = u.s
       LEFT JOIN octopus_event y ON y.sid = src.id AND y.epoch = u.e AND y.seq = u.q;
+    -- Never acknowledge an event that was not processed: a source not found here (the caller believed it registered,
+    -- or its registration is not visible yet) aborts the batch, and the caller retries with registration. (Reporting
+    -- such events as duplicates lost them: matrix-31, 4,987 first events acknowledged and never stored.)
+    IF (SELECT COUNT(*) FROM octopus_tmp_x) < (SELECT COUNT(*) FROM octopus_tmp_u) THEN
+        ROLLBACK;
+        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'octopus: unknown source in publish batch';
+    END IF;
     -- (rows stored by a concurrent publish meanwhile are ignored by the key)
     INSERT IGNORE INTO octopus_event (sid, epoch, seq, grp, body, body_hash, skip_to)
     SELECT x.sid, x.e, x.q, x.g, u.b, x.h, x.k FROM octopus_tmp_x x JOIN octopus_tmp_u u ON u.i = x.i
@@ -226,7 +233,6 @@ BEGIN
     SELECT x.sid, x.e, x.q, u.b FROM octopus_tmp_st st JOIN octopus_tmp_x x ON x.i = st.i JOIN octopus_tmp_u u ON u.i = st.i
      WHERE st.code = 6;
     COMMIT;
-    -- events of a source unknown here (registration failed) are reported as duplicates (code 1)
     SELECT u.i, COALESCE(st.code, 1) AS code, CASE WHEN st.code IN (0, 1, 3) THEN st.miss ELSE 0 END AS missing
       FROM octopus_tmp_u u LEFT JOIN octopus_tmp_st st ON st.i = u.i ORDER BY u.i;
 END
