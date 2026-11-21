@@ -17,6 +17,7 @@ path = "src/main.rs"
 [dependencies]
 octopus-core.workspace = true
 octopus-pg = { path = "../octopus-pg" }
+octopus-mssql = { path = "../octopus-mssql" }
 octopus-proto = { path = "../octopus-proto" }
 octopus-fabric = { path = "../octopus-fabric" }
 bytes.workspace = true

@@ -750,6 +750,7 @@ dependencies = [
  "octopus-client",
  "octopus-core",
  "octopus-fabric",
+ "octopus-mssql",
  "octopus-pg",
  "octopus-proto",
  "tokio",

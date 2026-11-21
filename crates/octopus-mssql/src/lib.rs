@@ -119,6 +119,7 @@ pub struct MssqlBackend {
     schema: String,
     apply_hook: Option<String>,
     load_hook: Option<String>,
+    deadlocks: std::sync::atomic::AtomicU64,
 }
 
 const KNOWN_MAX: usize = 1_000_000;
@@ -160,7 +161,14 @@ impl MssqlBackend {
         }
         let config = Config::from_ado_string(&cfg.connection).map_err(|e| Error::Config(format!("connection string: {e}")))?;
         let pool = Pool { config, idle: Mutex::new(vec![]), slots: Arc::new(Semaphore::new(cfg.pool_size.max(1))) };
-        let b = Self { pool, known: Default::default(), schema: cfg.schema.clone(), apply_hook: cfg.apply_hook, load_hook: cfg.load_hook };
+        let b = Self {
+            pool,
+            known: Default::default(),
+            schema: cfg.schema.clone(),
+            apply_hook: cfg.apply_hook,
+            load_hook: cfg.load_hook,
+            deadlocks: Default::default(),
+        };
         if cfg.migrate {
             b.migrate().await?;
         }
@@ -236,18 +244,37 @@ impl MssqlBackend {
     }
 
     /// The first result set of a parameterized statement.
+    ///
+    /// A deadlock victim (1205) is retried: SQL Server picks one when lock orders cross, and it does not guarantee that
+    /// `INSERT ... SELECT ... ORDER BY` inserts in that order, so even ordered publishes can meet. The victim's
+    /// transaction is rolled back whole, and every operation here is idempotent or monotonic, so a retry is safe.
     async fn rows(&self, sql: &str, params: &[&dyn ToSql]) -> Result<Vec<Row>> {
-        let mut p = self.pool.get().await?;
-        let r = async { p.c().query(sql, params).await?.into_first_result().await }.await.map_err(db)?;
-        p.ok();
-        Ok(r)
+        let mut attempt = 0u64;
+        loop {
+            let mut p = self.pool.get().await?;
+            match async { p.c().query(sql, params).await?.into_first_result().await }.await {
+                Ok(r) => {
+                    p.ok();
+                    return Ok(r);
+                }
+                Err(e) if retryable(&e) && attempt < 10 => {
+                    p.ok(); // the server rolled the victim back; the connection is fine
+                    attempt += 1;
+                    self.deadlocks.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    tokio::time::sleep(Duration::from_millis(2 * attempt * attempt)).await;
+                }
+                Err(e) => return Err(db(e)),
+            }
+        }
     }
 
     async fn exec(&self, sql: &str, params: &[&dyn ToSql]) -> Result<()> {
-        let mut p = self.pool.get().await?;
-        async { p.c().query(sql, params).await?.into_results().await }.await.map_err(db)?;
-        p.ok();
-        Ok(())
+        self.rows(sql, params).await.map(|_| ())
+    }
+
+    /// Deadlock victims retried so far (statistics).
+    pub fn deadlocks(&self) -> u64 {
+        self.deadlocks.load(std::sync::atomic::Ordering::Relaxed)
     }
 }
 
@@ -654,7 +681,9 @@ impl Backend for MssqlBackend {
         if groups.is_empty() {
             return Ok(vec![]);
         }
-        // sources with something stored beyond the cursor but no head; the first stored position tells the gap
+        // sources with something stored beyond the cursor but no head; the first stored position tells the gap.
+        // (A zero age takes every gap: SYSUTCDATETIME read in two sessions can differ by milliseconds, so an event
+        // stored just now could look younger than "now".)
         let sql = self.q(&format!(
             "SELECT CAST(s.grp AS nvarchar(256)), CAST(s.source AS nvarchar(256)), s.epoch, s.last_seq, f.epoch, f.seq, \
                     DATEDIFF_BIG(MICROSECOND, w.first_enq, SYSUTCDATETIME()), g.gap_skip_ms \
@@ -667,7 +696,7 @@ impl Backend for MssqlBackend {
                             WHERE e.sid = s.id AND (e.epoch > s.epoch OR (e.epoch = s.epoch AND e.seq > s.last_seq)) \
                             ORDER BY e.epoch, e.seq) f \
               WHERE s.grp IN (SELECT CAST(v {U8} FROM OPENJSON(@P1) WITH (v nvarchar(256) '$')) \
-                AND w.n > 0 AND w.first_enq < DATEADD(MILLISECOND, -@P2, SYSUTCDATETIME()) \
+                AND w.n > 0 AND (@P2 = 0 OR w.first_enq <= DATEADD(MILLISECOND, -@P2, SYSUTCDATETIME())) \
                 AND NOT EXISTS (SELECT 1 FROM octopus.event h WHERE h.sid = s.id AND h.epoch = s.epoch AND h.seq = s.last_seq + 1) \
               ORDER BY 7 DESC OFFSET 0 ROWS FETCH NEXT @P3 ROWS ONLY"
         ));

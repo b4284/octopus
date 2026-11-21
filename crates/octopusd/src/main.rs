@@ -4,8 +4,10 @@
 //! |---|---|
 //! | `OCTOPUS_MEMBER_ID` | the host name |
 //! | `OCTOPUS_NS` | `octopus` |
+//! | `OCTOPUS_BACKEND` | `pg` (PostgreSQL) or `mssql` (SQL Server 2025) |
 //! | `OCTOPUS_PG` | `host=127.0.0.1 port=5432 user=octopus dbname=octopus` |
-//! | `OCTOPUS_PG_POOL` | `32` |
+//! | `OCTOPUS_MSSQL` (ADO.NET style) | `server=tcp:127.0.0.1,1433;database=octopus;user=octopus;TrustServerCertificate=true` |
+//! | `OCTOPUS_PG_POOL` (either backend) | `32` |
 //! | `OCTOPUS_SCHEMA` | `octopus` |
 //! | `OCTOPUS_APPLY_HOOK`, `OCTOPUS_LOAD_HOOK` | none |
 //! | `OCTOPUS_MQTT_HOST`, `OCTOPUS_MQTT_PORT` | `127.0.0.1`, `1883` |
@@ -19,7 +21,9 @@
 
 use std::time::Duration;
 
+use octopus_core::Backend;
 use octopus_fabric::{Fabric, MqttConfig};
+use octopus_mssql::{MssqlBackend, MssqlConfig};
 use octopus_pg::{PgBackend, PgConfig};
 use octopus_proto::Topics;
 use octopusd::{Config, Dispatcher};
@@ -59,23 +63,48 @@ async fn main() {
         std::process::exit(2);
     }
 
-    let mut pg = PgConfig::new(env("OCTOPUS_PG", "host=127.0.0.1 port=5432 user=octopus dbname=octopus"));
-    pg.pool_size = env("OCTOPUS_PG_POOL", "32").parse().unwrap_or(32);
-    pg.schema = env("OCTOPUS_SCHEMA", "octopus");
-    pg.apply_hook = std::env::var("OCTOPUS_APPLY_HOOK").ok().filter(|s| !s.is_empty());
-    pg.load_hook = std::env::var("OCTOPUS_LOAD_HOOK").ok().filter(|s| !s.is_empty());
+    let pool: usize = env("OCTOPUS_PG_POOL", "32").parse().unwrap_or(32);
+    let schema = env("OCTOPUS_SCHEMA", "octopus");
+    let apply_hook = std::env::var("OCTOPUS_APPLY_HOOK").ok().filter(|s| !s.is_empty());
+    let load_hook = std::env::var("OCTOPUS_LOAD_HOOK").ok().filter(|s| !s.is_empty());
     // known heads are handed out straight away unless contexts must be preloaded for them
-    cfg.fast_path = pg.load_hook.is_none();
-    let backend = loop {
-        match PgBackend::connect(pg.clone()).await {
-            Ok(b) => break b,
+    cfg.fast_path = load_hook.is_none();
+    match env("OCTOPUS_BACKEND", "pg").as_str() {
+        "mssql" => {
+            let mut c = MssqlConfig::new(env("OCTOPUS_MSSQL", "server=tcp:127.0.0.1,1433;database=octopus;user=octopus;TrustServerCertificate=true"));
+            (c.pool_size, c.schema, c.apply_hook, c.load_hook) = (pool, schema, apply_hook, load_hook);
+            serve(cfg, retry(|| MssqlBackend::connect(c.clone())).await).await
+        }
+        "pg" => {
+            let mut c = PgConfig::new(env("OCTOPUS_PG", "host=127.0.0.1 port=5432 user=octopus dbname=octopus"));
+            (c.pool_size, c.schema, c.apply_hook, c.load_hook) = (pool, schema, apply_hook, load_hook);
+            serve(cfg, retry(|| PgBackend::connect(c.clone())).await).await
+        }
+        other => {
+            error!(backend = other, "OCTOPUS_BACKEND: use pg or mssql");
+            std::process::exit(2);
+        }
+    }
+}
+
+/// Connects, retrying every second until the database is reachable.
+async fn retry<B, F, Fut>(connect: F) -> B
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = octopus_core::Result<B>>,
+{
+    loop {
+        match connect().await {
+            Ok(b) => return b,
             Err(e) => {
                 error!(error = %e, "database not reachable; retrying");
                 tokio::time::sleep(Duration::from_secs(1)).await;
             }
         }
-    };
+    }
+}
 
+async fn serve<B: Backend>(cfg: octopusd::Config, backend: B) {
     let topics = Topics::new(cfg.ns.clone());
     let mut mq = MqttConfig::new(
         env("OCTOPUS_MQTT_HOST", "127.0.0.1"),
@@ -84,7 +113,7 @@ async fn main() {
     );
     mq.username = std::env::var("OCTOPUS_MQTT_USER").ok();
     mq.password = std::env::var("OCTOPUS_MQTT_PASSWORD").ok();
-    mq.last_will = Some(Dispatcher::<PgBackend>::last_will(&topics, &cfg.member_id));
+    mq.last_will = Some(Dispatcher::<B>::last_will(&topics, &cfg.member_id));
     let (fabric, incoming) = Fabric::connect_mqtt(mq);
 
     let (stop_tx, stop_rx) = watch::channel(false);

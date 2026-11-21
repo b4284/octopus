@@ -39,7 +39,7 @@ CREATE TABLE octopus.source (
 );
 GO
 IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'source_grp' AND object_id = OBJECT_ID('octopus.source'))
-    CREATE INDEX source_grp ON octopus.source (grp, source) INCLUDE (id, epoch, last_seq);
+    CREATE INDEX source_grp ON octopus.source (grp, source) INCLUDE (id, epoch, last_seq) WITH (ALLOW_PAGE_LOCKS = OFF);
 GO
 
 -- Stored events not yet applied. Rows are inserted and deleted at the event rate: no lock escalation (a table lock
@@ -61,7 +61,13 @@ CREATE TABLE octopus.event (
     CONSTRAINT event_pkey PRIMARY KEY CLUSTERED (sid, epoch, seq) WITH (IGNORE_DUP_KEY = ON)
 );
 GO
+-- Row locks only on the hot tables: a page lock taken by a delete or an update would make every insert into that page
+-- wait (matrix-27: LCK_M_IX waits dominated), and no escalation to table locks.
 ALTER TABLE octopus.event SET (LOCK_ESCALATION = DISABLE);
+ALTER TABLE octopus.source SET (LOCK_ESCALATION = DISABLE);
+ALTER INDEX event_pkey ON octopus.event SET (ALLOW_PAGE_LOCKS = OFF);
+ALTER INDEX source_pkey ON octopus.source SET (ALLOW_PAGE_LOCKS = OFF);
+ALTER INDEX source_id ON octopus.source SET (ALLOW_PAGE_LOCKS = OFF);
 GO
 IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'event_markers' AND object_id = OBJECT_ID('octopus.event'))
     CREATE INDEX event_markers ON octopus.event (sid) WHERE skip_to IS NOT NULL;
@@ -135,20 +141,25 @@ BEGIN
         WHILE 1 = 1
         BEGIN
             UPDATE s SET epoch = x.next_epoch, last_seq = 0
-              FROM octopus.source s JOIN @ids i ON i.id = s.id
+              FROM @ids i JOIN octopus.source s WITH (ROWLOCK, FORCESEEK) ON s.id = i.id
               JOIN octopus.epoch_end x ON x.sid = s.id AND x.epoch = s.epoch
-             WHERE s.last_seq >= x.last_seq AND x.next_epoch > s.epoch;
+             WHERE s.last_seq >= x.last_seq AND x.next_epoch > s.epoch
+            OPTION (LOOP JOIN, FORCE ORDER);
             IF @@ROWCOUNT = 0 BREAK;
         END;
     END;
     IF EXISTS (SELECT 1 FROM octopus.event e WITH (INDEX (event_markers)) JOIN @ids i ON i.id = e.sid WHERE e.skip_to IS NOT NULL)
         INSERT INTO octopus.skipped (sid, epoch, from_seq, to_seq, reason)
         SELECT e.sid, e.epoch, e.seq, e.skip_to, N'declared by the source'
-          FROM octopus.event e JOIN @ids i ON i.id = e.sid JOIN octopus.source s ON s.id = e.sid
-         WHERE e.skip_to IS NOT NULL AND (e.epoch < s.epoch OR (e.epoch = s.epoch AND e.seq <= s.last_seq));
+          FROM @ids i JOIN octopus.source s WITH (FORCESEEK) ON s.id = i.id
+          JOIN octopus.event e WITH (FORCESEEK) ON e.sid = s.id
+         WHERE e.skip_to IS NOT NULL AND (e.epoch < s.epoch OR (e.epoch = s.epoch AND e.seq <= s.last_seq))
+        OPTION (LOOP JOIN, FORCE ORDER);
     DELETE e
-      FROM octopus.event e JOIN @ids i ON i.id = e.sid JOIN octopus.source s ON s.id = e.sid
-     WHERE e.epoch < s.epoch OR (e.epoch = s.epoch AND e.seq <= s.last_seq);
+      FROM @ids i JOIN octopus.source s WITH (FORCESEEK) ON s.id = i.id
+      JOIN octopus.event e WITH (ROWLOCK, FORCESEEK) ON e.sid = s.id
+     WHERE e.epoch < s.epoch OR (e.epoch = s.epoch AND e.seq <= s.last_seq)
+    OPTION (LOOP JOIN, FORCE ORDER);
 END;
 GO
 
@@ -193,7 +204,8 @@ BEGIN
         BEGIN
             -- the cursor may already stand at the declared end: move it on now (source rows locked in order)
             DECLARE @lk int;
-            SELECT @lk = COUNT(*) FROM octopus.source s WITH (UPDLOCK, ROWLOCK) WHERE s.id IN (SELECT id FROM @declared);
+            SELECT @lk = COUNT(*) FROM @declared d JOIN octopus.source s WITH (UPDLOCK, ROWLOCK, FORCESEEK) ON s.id = d.id
+            OPTION (LOOP JOIN, FORCE ORDER);
             EXEC octopus.settle @declared;
         END;
     END;
@@ -204,7 +216,8 @@ BEGIN
     SELECT u.i, u.g, src.id, src.grp, src.epoch, src.last_seq, u.e, u.q, u.b, u.h, u.k,
            -- the highest position covered by a batchmate below this one (same source and epoch)
            MAX(COALESCE(u.k, u.q)) OVER (PARTITION BY src.id, u.e ORDER BY u.q ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING)
-      FROM @u u JOIN octopus.source src ON src.source = u.s;
+      FROM @u u JOIN octopus.source src WITH (FORCESEEK) ON src.source = u.s
+    OPTION (LOOP JOIN);
     DECLARE @ins TABLE (sid bigint, epoch bigint, seq bigint, PRIMARY KEY (sid, epoch, seq));
     -- (rows already stored, by this or a concurrent publish, are ignored by the key and not in the output)
     INSERT INTO octopus.event (sid, epoch, seq, grp, body, body_hash, skip_to)
@@ -266,7 +279,10 @@ BEGIN
     DECLARE @applied TABLE (n int IDENTITY PRIMARY KEY, s varchar(256) COLLATE Latin1_General_100_BIN2_UTF8, q bigint, f varchar(max));
     DECLARE @ids octopus.idlist;
     BEGIN TRANSACTION;
-    INSERT INTO @ids SELECT s.id FROM octopus.source s WITH (UPDLOCK, ROWLOCK) WHERE s.source IN (SELECT s FROM @u);
+    DECLARE @k TABLE (s varchar(256) COLLATE Latin1_General_100_BIN2_UTF8 PRIMARY KEY WITH (IGNORE_DUP_KEY = ON));
+    INSERT INTO @k SELECT s FROM @u;
+    INSERT INTO @ids SELECT s.id FROM @k k JOIN octopus.source s WITH (UPDLOCK, ROWLOCK, FORCESEEK) ON s.source = k.s
+    OPTION (LOOP JOIN, FORCE ORDER);
     DECLARE @i int, @s varchar(256), @e bigint, @q bigint, @f varchar(max), @ce bigint, @cs bigint;
     DECLARE c CURSOR LOCAL FAST_FORWARD FOR SELECT i, s, e, q, f FROM @u ORDER BY s, e, q;
     OPEN c;
@@ -316,8 +332,9 @@ BEGIN
           FROM OPENJSON(@j) WITH (s nvarchar(256) '$.s', e bigint '$.e', q bigint '$.q')) z
      WHERE rn = 1;
     UPDATE src SET epoch = w.e, last_seq = w.q
-      FROM octopus.source src WITH (ROWLOCK) JOIN @w w ON src.source = w.s
-     WHERE w.e > src.epoch OR (w.e = src.epoch AND w.q > src.last_seq);
+      FROM @w w JOIN octopus.source src WITH (ROWLOCK, FORCESEEK) ON src.source = w.s
+     WHERE w.e > src.epoch OR (w.e = src.epoch AND w.q > src.last_seq)
+    OPTION (LOOP JOIN, FORCE ORDER);
 END;
 GO
 
@@ -335,7 +352,10 @@ BEGIN
     DECLARE @ids octopus.idlist;
     DECLARE @rc TABLE (i int PRIMARY KEY, rc smallint);
     BEGIN TRANSACTION;
-    INSERT INTO @ids SELECT s.id FROM octopus.source s WITH (UPDLOCK, ROWLOCK) WHERE s.source IN (SELECT s FROM @u);
+    DECLARE @k TABLE (s varchar(256) COLLATE Latin1_General_100_BIN2_UTF8 PRIMARY KEY WITH (IGNORE_DUP_KEY = ON));
+    INSERT INTO @k SELECT s FROM @u;
+    INSERT INTO @ids SELECT s.id FROM @k k JOIN octopus.source s WITH (UPDLOCK, ROWLOCK, FORCESEEK) ON s.source = k.s
+    OPTION (LOOP JOIN, FORCE ORDER);
     INSERT INTO @rc
     SELECT u.i, CASE WHEN s.epoch < u.e OR (s.epoch = u.e AND s.last_seq < u.q) THEN 0 ELSE 1 END
       FROM @u u LEFT JOIN octopus.source s ON s.source = u.s;
@@ -359,8 +379,10 @@ BEGIN
     SET XACT_ABORT ON;
     DECLARE @ids octopus.idlist;
     BEGIN TRANSACTION;
-    INSERT INTO @ids SELECT s.id FROM octopus.source s WITH (UPDLOCK, ROWLOCK)
-     WHERE s.source IN (SELECT CAST(s COLLATE Latin1_General_100_BIN2_UTF8 AS varchar(256)) FROM OPENJSON(@j) WITH (s nvarchar(256) '$.s'));
+    DECLARE @k TABLE (s varchar(256) COLLATE Latin1_General_100_BIN2_UTF8 PRIMARY KEY WITH (IGNORE_DUP_KEY = ON));
+    INSERT INTO @k SELECT CAST(s COLLATE Latin1_General_100_BIN2_UTF8 AS varchar(256)) FROM OPENJSON(@j) WITH (s nvarchar(256) '$.s');
+    INSERT INTO @ids SELECT s.id FROM @k k JOIN octopus.source s WITH (UPDLOCK, ROWLOCK, FORCESEEK) ON s.source = k.s
+    OPTION (LOOP JOIN, FORCE ORDER);
     EXEC octopus.move_cursors @j;
     EXEC octopus.settle @ids;
     COMMIT;
