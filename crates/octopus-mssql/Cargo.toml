@@ -1,0 +1,23 @@
+[package]
+name = "octopus-mssql"
+version = "0.1.0"
+description = "Octopus backend for Microsoft SQL Server (2025 and later)"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+octopus-core.workspace = true
+bytes.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tiberius = { version = "0.13.0", default-features = false, features = ["tds73", "rustls"] }
+tokio-util = { version = "0.7", features = ["compat"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+base64 = "0.22"
+xxhash-rust = { version = "0.8.21", features = ["xxh3"] }
+
+[dev-dependencies]
+tokio.workspace = true

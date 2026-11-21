@@ -3,8 +3,8 @@
 **Ordered per-key event processing on a plain SQL database, with an active-active dispatcher cluster.**
 
 > **Status: early implementation, not production-ready.**
-> - The design is in [docs/design.md](docs/design.md), the measurements behind it in [docs/why.md](docs/why.md), and
->   the formal model in [spec/](spec/).
+> - The design is in [docs/design.md](docs/design.md), the measurements behind it in [docs/why.md](docs/why.md), the
+>   formal model in [spec/](spec/), and the drilled production topology in [docs/topology.md](docs/topology.md).
 > - Built so far: the Rust dispatcher (`octopusd`), the PostgreSQL backend, the MQTT 5 transport, and a Rust
 >   client for producers and workers.
 > - End-to-end tests pass with three dispatchers, one crashed (`kill -9`) and one stopped mid-run.
@@ -59,7 +59,14 @@ sent after the SQL commit.
 
 ## Databases
 
-Postgres first, then SQL Server and MySQL behind a small backend interface.
+Behind a small backend interface:
+- **PostgreSQL** (`octopus-pg`): the reference backend, drilled with Patroni across two data centers
+  ([docs/topology.md](docs/topology.md)).
+- **SQL Server 2025** (`octopus-mssql`): the same model in T-SQL stored procedures; batches travel as JSON. Passes the
+  same backend test suite as PostgreSQL. Not yet selectable in `octopusd`.
+- **YugabyteDB** runs the PostgreSQL backend unchanged (all tests pass), but needed 25–45× PostgreSQL's CPU per event
+  on this insert-then-delete workload: not recommended.
+- MySQL next.
 
 ## Try it
 

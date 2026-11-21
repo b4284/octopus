@@ -406,6 +406,21 @@ The dispatcher talks to the database through one small backend interface:
 Postgres comes first. SQL Server (availability group with synchronous commit) and MySQL (semi-sync
 `AFTER_SYNC`, or Group Replication) follow, each with its own failover drill.
 
+- **SQL Server 2025** (`crates/octopus-mssql`, 2026-11-21): tables and stored procedures mirroring the PostgreSQL
+  functions. SQL Server has no array parameters, so a batch is one JSON parameter unpacked with `OPENJSON`, bodies in
+  base64 (`BASE64_DECODE`, new in 2025). Names are varchar in a binary UTF-8 collation (byte order, as in Rust), read
+  from JSON as nvarchar and converted through that collation: a default code page would garble non-Latin names.
+  `IGNORE_DUP_KEY` keys play the part of `ON CONFLICT DO NOTHING` (`OUTPUT` returns only rows really inserted), no
+  lock escalation on the event table, `sp_getapplock` for the migration. Same 16-test suite as PostgreSQL, passing.
+- **YugabyteDB** (distributed SQL, 2026-11-21) runs the PostgreSQL backend unchanged: all tests pass once the migration
+  retries serialization failures. But at 16k events/s it needed 25–45× PostgreSQL's CPU per event:
+  - the cost-based optimizer plans from "empty" statistics and turns key lookups into index scans;
+  - every deleted event leaves a tombstone until compaction;
+  - every multi-row write is a distributed transaction.
+
+  A colocated database helped 1.7×. Not a fit for this insert-then-delete workload.
+- The production topology the PostgreSQL backend was drilled in: [topology.md](topology.md).
+
 ## 9. Verification before anyone relies on it
 
 1. **Oracle invariants G1–G6 on every run.** G1 is checked by having the producers record every
