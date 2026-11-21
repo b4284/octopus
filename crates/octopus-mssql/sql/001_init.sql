@@ -209,11 +209,12 @@ BEGIN
             EXEC octopus.settle @declared;
         END;
     END;
+    -- (bodies stay in @u only: table variables live in tempdb, and every copy of a body is written there)
     DECLARE @x TABLE (i int PRIMARY KEY, g varchar(256) COLLATE Latin1_General_100_BIN2_UTF8, sid bigint,
                       sgrp varchar(256) COLLATE Latin1_General_100_BIN2_UTF8, ce bigint, cs bigint, e bigint, q bigint,
-                      b varbinary(max), h bigint, k bigint, mate bigint);
+                      h bigint, k bigint, mate bigint);
     INSERT INTO @x
-    SELECT u.i, u.g, src.id, src.grp, src.epoch, src.last_seq, u.e, u.q, u.b, u.h, u.k,
+    SELECT u.i, u.g, src.id, src.grp, src.epoch, src.last_seq, u.e, u.q, u.h, u.k,
            -- the highest position covered by a batchmate below this one (same source and epoch)
            MAX(COALESCE(u.k, u.q)) OVER (PARTITION BY src.id, u.e ORDER BY u.q ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING)
       FROM @u u JOIN octopus.source src WITH (FORCESEEK) ON src.source = u.s
@@ -222,12 +223,12 @@ BEGIN
     -- (rows already stored, by this or a concurrent publish, are ignored by the key and not in the output)
     INSERT INTO octopus.event (sid, epoch, seq, grp, body, body_hash, skip_to)
     OUTPUT inserted.sid, inserted.epoch, inserted.seq INTO @ins
-    SELECT x.sid, x.e, x.q, x.g, x.b, x.h, x.k FROM @x x
+    SELECT x.sid, x.e, x.q, x.g, u.b, x.h, x.k FROM @x x JOIN @u u ON u.i = x.i
      WHERE x.sgrp = x.g AND (x.e > x.ce OR (x.e = x.ce AND x.q > x.cs))
      ORDER BY x.sid, x.e, x.q;          -- one insertion order for everyone: no deadlocks between publishes
-    DECLARE @st TABLE (i int PRIMARY KEY, sid bigint, e bigint, q bigint, b varbinary(max), code smallint, miss bigint);
+    DECLARE @st TABLE (i int PRIMARY KEY, sid bigint, e bigint, q bigint, code smallint, miss bigint);
     INSERT INTO @st
-    SELECT x.i, x.sid, x.e, x.q, x.b,
+    SELECT x.i, x.sid, x.e, x.q,
            CASE WHEN x.sgrp <> x.g THEN 2
                 WHEN n.sid IS NOT NULL AND x.e = x.ce AND x.q = x.cs + 1 THEN 3
                 WHEN n.sid IS NOT NULL THEN 0
@@ -253,8 +254,9 @@ BEGIN
       -- a row stored before this statement, looked up only for events not inserted now
       OUTER APPLY (SELECT TOP (1) 1 AS present, y.body_hash FROM octopus.event y
                     WHERE n.sid IS NULL AND y.sid = x.sid AND y.epoch = x.e AND y.seq = x.q) ex;
-    INSERT INTO octopus.late (sid, epoch, seq, body)
-    SELECT sid, e, q, b FROM @st WHERE code = 6;
+    IF EXISTS (SELECT 1 FROM @st WHERE code = 6)
+        INSERT INTO octopus.late (sid, epoch, seq, body)
+        SELECT st.sid, st.e, st.q, u.b FROM @st st JOIN @u u ON u.i = st.i WHERE st.code = 6;
     COMMIT;
     -- events of a source unknown here (registration failed) are reported as duplicates (code 1), as in PostgreSQL
     SELECT u.i, COALESCE(st.code, CAST(1 AS smallint)) AS code,
