@@ -119,6 +119,8 @@ struct GroupState {
     suspect: HashSet<(String, Pos)>,
     /// Events stored before this instant (Unix µs, with slack) may have been handed out by the previous owner.
     claimed_us: i64,
+    /// The lease epoch this member holds the group under (announced to clients).
+    lease_epoch: i64,
     last_demand: Option<Instant>,
     /// source -> last position known done by this owner (stale hints are ignored)
     cursor: HashMap<String, Pos>,
@@ -135,6 +137,9 @@ struct GroupState {
     want_fetching: bool,
     last_want_fetch: Option<Instant>,
 }
+
+/// Repeat the retained member and owner announcements this often (lease ticks; 10 x 500 ms = 5 s).
+const ANNOUNCE_EVERY_TICKS: u64 = 10;
 
 /// Bodies kept for not-yet-head events, per group (beyond that, the database is read).
 const PENDING_MAX_PER_GROUP: usize = 4096;
@@ -1478,10 +1483,28 @@ impl<B: Backend> Dispatcher<B> {
                 Err(e) => warn!(error = %e, "lease tick failed"),
             }
             ticks += 1;
+            if ticks % ANNOUNCE_EVERY_TICKS == 0 {
+                self.announce().await;
+            }
             tokio::select! {
                 _ = tokio::time::sleep(self.cfg.tick.saturating_sub(started.elapsed())) => {}
                 _ = stop.changed() => return,
             }
+        }
+    }
+
+    /// Publish this member's retained announcements again: who it is (its inbox) and which groups it serves.
+    /// Retained messages are only a cache in the broker: a broker without persistence loses them on restart, and an
+    /// abrupt disconnect makes the broker publish our "gone" will. Clients rebuild their view from these, so they are
+    /// repeated rather than published once.
+    async fn announce(&self) {
+        let info = v1::MemberInfo { member_id: self.cfg.member_id.clone(), inbox: self.inbox.clone(), started_us: self.started_us };
+        let _ = self.fabric.publish_retained(self.topics.member(&self.cfg.member_id), Bytes::from(info.encode_to_vec())).await;
+        let owned: Vec<(String, i64)> =
+            self.core.lock().unwrap().groups.iter().filter(|(_, g)| g.serving).map(|(n, g)| (n.clone(), g.lease_epoch)).collect();
+        for (group, epoch) in owned {
+            let o = v1::OwnerInfo { group: group.clone(), member_id: self.cfg.member_id.clone(), inbox: self.inbox.clone(), epoch };
+            let _ = self.fabric.publish_retained(self.topics.owner(&group), Bytes::from(o.encode_to_vec())).await;
         }
     }
 
@@ -1553,7 +1576,10 @@ impl<B: Backend> Dispatcher<B> {
                     for l in &got {
                         // events stored before now (+1 s for clock skew) may have been handed out by the previous owner
                         let claimed_us = now_us() + 1_000_000;
-                        core.groups.insert(l.group.clone(), GroupState { serving: true, dirty: true, claimed_us, ..Default::default() });
+                        core.groups.insert(
+                            l.group.clone(),
+                            GroupState { serving: true, dirty: true, claimed_us, lease_epoch: l.epoch, ..Default::default() },
+                        );
                     }
                 }
                 self.stats.claims.fetch_add(got.len() as u64, Relaxed);

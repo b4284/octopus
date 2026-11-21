@@ -312,6 +312,20 @@ buffers without limit and never drops.
   2 workers and 2 seqs per epoch; and 239M distinct states of the full 2-dispatcher instance before it was
   stopped unfinished. No violation.
 
+### 5.5 Found in the Patroni drills (2026-11-21)
+
+- **Two data nodes in strict synchronous mode stop writing when one is lost.** A commit needs the synchronous
+  standby; after a failover the new primary has none until the lost node returns (or another replica is added).
+  Measured: the leader was killed, Patroni promoted the standby in 19 s, and then no commit completed for hours,
+  because the killed node was not restarted. Zero loss and write availability after a node loss need at least
+  three data-bearing nodes (any one of two standbys confirms), or a relaxed mode that accepts a single copy for a
+  while. This is an owner decision (benchmark backlog B28).
+- **A cancelled commit is acknowledged without replication.** If a client cancels a commit while it waits for
+  the synchronous standby (a command timeout, a statement timeout, a cancel request), PostgreSQL keeps it
+  locally and reports success with only a warning. Octopus's dispatchers never cancel or time out a commit.
+  Workers that commit their own writes must not either: no statement timeout and no client command timeout on
+  commits against the synchronous cluster, or a "committed" result may be lost by the next failover.
+
 ## 6. Failure walk-through
 
 | event | what happens | loss? |
