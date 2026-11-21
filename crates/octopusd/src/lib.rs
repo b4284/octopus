@@ -114,6 +114,13 @@ struct GroupState {
     dirty: bool,
     fetching: bool,
     last_fetch: Option<Instant>,
+    /// source -> a position done here whose cursor is not written to the database yet (queued or being written).
+    /// Head reads leave these sources out: until the write, the database still sees the done event as the head
+    /// (matrix-24: 260k head reads per run returned such stale heads and yielded 666 new events).
+    unwritten: HashMap<String, Pos>,
+    /// heads queued, by origin: 0 publish hint, 1 pending (on its predecessor's "done"), 2 head read, 3 key lookup or
+    /// the next event returned with a removal
+    offered: [u64; 4],
     /// why the current head read was started (0 dirty, 1 fallback timer, 2 zero-credit probe): statistics only
     fetch_why: usize,
     /// Events this dispatcher handed out whose outcome is unknown (timed out, or "done" hit a database error):
@@ -210,7 +217,13 @@ impl GroupState {
             self.pending.remove(source);
         }
         match next {
-            Some(h) => self.offer(h),
+            Some(h) => {
+                let ok = self.offer(h);
+                if ok {
+                    self.offered[1] += 1;
+                }
+                ok
+            }
             None => {
                 self.want_if_stored(source, pos.next());
                 false
@@ -248,7 +261,9 @@ impl GroupState {
                             attempts: 0,
                             enqueued_at_us: e.enqueued_us,
                         };
-                        self.offer(head);
+                        if self.offer(head) {
+                            self.offered[0] += 1;
+                        }
                     }
                     None => {
                         self.want.insert(e.source, pos);
@@ -260,7 +275,9 @@ impl GroupState {
                     Some(body) => {
                         let head =
                             Head { group: group.to_owned(), key: EventKey::new(e.source, pos), body, skip_to: e.skip_to, attempts: 0, enqueued_at_us: e.enqueued_us };
-                        self.offer(head);
+                        if self.offer(head) {
+                            self.offered[0] += 1;
+                        }
                     }
                     None => {
                         self.want.insert(e.source, pos);
@@ -314,8 +331,9 @@ struct Core {
     owners: HashMap<String, (String, String)>,
     /// Hand out nothing after this instant unless the leases were renewed (local lease deadline).
     lease_deadline: Option<Instant>,
-    /// Cursors moved by "done" reports and not yet written to the database (flushed every ~100 ms).
-    unflushed: HashMap<String, Pos>,
+    /// Cursors moved by "done" reports and not yet written to the database (flushed every ~100 ms): source ->
+    /// (group, position).
+    unflushed: HashMap<String, (String, Pos)>,
     /// Position ranges skipped so far (source markers consumed here, gaps given up after the timeout).
     skips: u64,
 }
@@ -360,8 +378,10 @@ impl Core {
                 let (source, from) = (r.head.key.source, r.head.key.pos);
                 let to = Pos::new(from.epoch, r.head.skip_to.unwrap_or(from.seq).max(from.seq));
                 st.skipped.entry(source.clone()).or_default().push(Skipped { epoch: from.epoch, from_seq: from.seq, to_seq: Some(to.seq) });
-                let u = unflushed.entry(source.clone()).or_default();
-                *u = (*u).max(to);
+                let u = unflushed.entry(source.clone()).or_insert_with(|| (g.clone(), to));
+                u.1 = u.1.max(to);
+                let w = st.unwritten.entry(source.clone()).or_insert(to);
+                *w = (*w).max(to);
                 *skips += 1;
                 st.done(g, &source, to);
             }
@@ -487,7 +507,7 @@ impl Core {
                     st.fetching = true;
                     st.fetch_why = 2;
                     st.dirty = false;
-                    let exclude = st.inflight.keys().cloned().collect();
+                    let exclude = st.inflight.keys().chain(st.unwritten.keys()).cloned().collect();
                     reqs.push(HeadRequest { group: g.clone(), max: 1, exclude_sources: exclude });
                 }
                 continue;
@@ -498,7 +518,13 @@ impl Core {
             st.fetching = true;
             st.fetch_why = if st.dirty { 0 } else { 1 };
             st.dirty = false;
-            let exclude = st.inflight.keys().cloned().chain(st.ready.iter().map(|r| r.head.key.source.clone())).collect();
+            let exclude = st
+                .inflight
+                .keys()
+                .chain(st.unwritten.keys())
+                .cloned()
+                .chain(st.ready.iter().map(|r| r.head.key.source.clone()))
+                .collect();
             reqs.push(HeadRequest { group: g.clone(), max: want - st.ready.len(), exclude_sources: exclude });
         }
         reqs
@@ -743,9 +769,12 @@ impl<B: Backend> Dispatcher<B> {
                                         unhold(workers, &w);
                                     }
                                     st.done(&it.group, &it.source, Pos::new(it.epoch, it.seq));
+                                    let w = st.unwritten.entry(it.source.clone()).or_insert(Pos::new(it.epoch, it.seq));
+                                    *w = (*w).max(Pos::new(it.epoch, it.seq));
                                 }
-                                let c = core.unflushed.entry(it.source.clone()).or_default();
-                                *c = (*c).max(Pos::new(it.epoch, it.seq));
+                                let pos = Pos::new(it.epoch, it.seq);
+                                let c = core.unflushed.entry(it.source.clone()).or_insert_with(|| (it.group.clone(), pos));
+                                c.1 = c.1.max(pos);
                                 self.stats.applied.fetch_add(1, Relaxed);
                             }
                         }
@@ -1210,7 +1239,9 @@ impl<B: Backend> Dispatcher<B> {
                             match n {
                                 Some(mut h) => {
                                     h.group = g.clone();
-                                    st.offer(h);
+                                    if st.offer(h) {
+                                        st.offered[3] += 1;
+                                    }
                                 }
                                 None => {
                                     if st.known_max.get(&s).is_some_and(|m| *m > q) {
@@ -1301,6 +1332,7 @@ impl<B: Backend> Dispatcher<B> {
                         let known = st.inflight.contains_key(&h.key.source)
                             || st.ready.iter().any(|r| r.head.key.source == h.key.source);
                         if st.serving && !known {
+                            st.offered[2] += 1;
                             st.ready.push_back(ReadyHead { head: h.clone(), context: c.clone() });
                         }
                     }
@@ -1376,7 +1408,9 @@ impl<B: Backend> Dispatcher<B> {
                         if st.want.get(&h.key.source) == Some(&h.key.pos) {
                             st.want.remove(&h.key.source);
                         }
-                        st.offer(h.clone());
+                        if st.offer(h.clone()) {
+                            st.offered[3] += 1;
+                        }
                     }
                 }
             }
@@ -1425,19 +1459,33 @@ impl<B: Backend> Dispatcher<B> {
 
     /// Write the cursors moved by "done" reports (one bulk statement). On failure they are kept for the next try.
     async fn flush_cursors(&self) {
-        let batch: Vec<(String, Pos)> = {
+        let batch: Vec<(String, (String, Pos))> = {
             let mut core = self.core.lock().unwrap();
             if core.unflushed.is_empty() {
                 return;
             }
             core.unflushed.drain().collect()
         };
-        if let Err(e) = self.backend.advance(&batch).await {
-            warn!(error = %e, n = batch.len(), "cursor flush failed; will retry");
-            let mut core = self.core.lock().unwrap();
-            for (s, q) in batch {
-                let c = core.unflushed.entry(s).or_default();
-                *c = (*c).max(q);
+        let cursors: Vec<(String, Pos)> = batch.iter().map(|(s, (_, q))| (s.clone(), *q)).collect();
+        let result = self.backend.advance(&cursors).await;
+        let mut core = self.core.lock().unwrap();
+        match result {
+            Ok(()) => {
+                // written: head reads may look at these sources again (unless done again meanwhile)
+                for (s, (g, q)) in batch {
+                    if let Some(st) = core.groups.get_mut(&g) {
+                        if st.unwritten.get(&s).is_some_and(|w| *w <= q) {
+                            st.unwritten.remove(&s);
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                warn!(error = %e, n = batch.len(), "cursor flush failed; will retry");
+                for (s, (g, q)) in batch {
+                    let c = core.unflushed.entry(s).or_insert_with(|| (g, q));
+                    c.1 = c.1.max(q);
+                }
             }
         }
     }
@@ -1760,6 +1808,15 @@ impl<B: Backend> Dispatcher<B> {
                     Err(e) => warn!(error = %e, "purge failed"),
                 }
             }
+            let offered: [u64; 4] = {
+                let core = self.core.lock().unwrap();
+                core.groups.values().fold([0; 4], |mut a, g| {
+                    for i in 0..4 {
+                        a[i] += g.offered[i];
+                    }
+                    a
+                })
+            };
             let (groups, workers, inflight, ready, skips) = {
                 let core = self.core.lock().unwrap();
                 (
@@ -1783,7 +1840,8 @@ impl<B: Backend> Dispatcher<B> {
                 reads_dirty = s.group_reads[0].load(Relaxed), found_dirty = s.group_reads_found[0].load(Relaxed),
                 reads_fallback = s.group_reads[1].load(Relaxed), found_fallback = s.group_reads_found[1].load(Relaxed),
                 reads_probe = s.group_reads[2].load(Relaxed), found_probe = s.group_reads_found[2].load(Relaxed),
-                key_fetches = s.key_fetches.load(Relaxed), key_found = s.key_found.load(Relaxed), "stats"
+                key_fetches = s.key_fetches.load(Relaxed), key_found = s.key_found.load(Relaxed),
+                offered_hint = offered[0], offered_pending = offered[1], offered_read = offered[2], offered_key = offered[3], "stats"
             );
         }
     }
