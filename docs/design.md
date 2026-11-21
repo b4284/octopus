@@ -326,6 +326,18 @@ buffers without limit and never drops.
   Workers that commit their own writes must not either: no statement timeout and no client command timeout on
   commits against the synchronous cluster, or a "committed" result may be lost by the next failover.
 
+- **Layout chosen (owner, 2026-11-21): 2 + 2.** Two database nodes per DC, etcd members in DC1, DC2 and the witness
+  site. Patroni quorum mode with `synchronous_node_count: 2`: a commit waits for any 2 of the 3 standbys, so it
+  always reaches the other DC. After losing a node or a whole DC, Patroni lowers the quorum to the standbys still
+  alive and writes continue. Drilled in the lab: leader node killed, either DC killed (its etcd member included),
+  the leader's DC frozen for 60 s; every run kept every acknowledged write.
+- **etcd must be 3.5.13 or newer.** With 3.5.9, freezing the leader's DC for 60 s (a VM pause or a storage stall
+  looks the same) made the resumed etcd member's stale lease revocations apply in the new term: the new primary's
+  leader key vanished, the old primary took the lead again, and the new primary's timeline was rewound away
+  (acknowledged writes lost). Fixed upstream in 3.5.13; with 3.5.17 the same drill keeps the new primary.
+- **Run Patroni with a watchdog** in production: it resets a node whose Patroni stalls past the leader lease, the
+  defence Patroni documents against a paused primary resuming with a stale belief.
+
 ## 6. Failure walk-through
 
 | event | what happens | loss? |
