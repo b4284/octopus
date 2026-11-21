@@ -91,6 +91,15 @@ impl NatsConfig {
     }
 }
 
+/// A comma-separated server list (async-nats parses one URL per string).
+fn nats_servers(url: &str) -> Result<Vec<async_nats::ServerAddr>> {
+    url.split(',')
+        .map(str::trim)
+        .filter(|u| !u.is_empty())
+        .map(|u| u.parse::<async_nats::ServerAddr>().map_err(|e| Error::Fabric(format!("NATS server {u:?}: {e}"))))
+        .collect()
+}
+
 /// Handle for publishing and subscribing; cheap to clone.
 #[derive(Clone)]
 pub struct Fabric {
@@ -250,7 +259,7 @@ impl Fabric {
         if let (Some(u), Some(p)) = (cfg.username.clone(), cfg.password.clone()) {
             opts = opts.user_and_password(u, p);
         }
-        let client = opts.connect(cfg.url.as_str()).await.map_err(|e| Error::Fabric(e.to_string()))?;
+        let client = opts.connect(nats_servers(&cfg.url)?).await.map_err(|e| Error::Fabric(e.to_string()))?;
         let (tx, rx) = mpsc::channel(cfg.capacity);
         Ok((Fabric { inner: Inner::Nats { client, tx }, subscriptions: Arc::new(Mutex::new(BTreeSet::new())) }, rx))
     }
@@ -320,6 +329,13 @@ impl Fabric {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_server_list_is_split_on_commas() {
+        assert_eq!(nats_servers("nats://127.0.0.1:6440, nats://127.0.0.1:6441,nats://h:4222").unwrap().len(), 3);
+        assert_eq!(nats_servers("nats://127.0.0.1:4222").unwrap().len(), 1);
+        assert!(nats_servers("nats://127.0.0.1:x").is_err());
+    }
 
     #[test]
     fn topics_map_to_subjects_and_back() {
