@@ -56,6 +56,9 @@ CREATE TABLE IF NOT EXISTS octopus.event (
         autovacuum_vacuum_cost_delay = 0);
 -- Bodies are stored as they are: compressing multi-megabyte events on every insert costs more CPU than it saves.
 ALTER TABLE octopus.event ALTER COLUMN body SET STORAGE EXTERNAL;
+-- Rows up to ~8 KB stay in the table itself: below the default target (~2 KB) every body would be moved to the TOAST
+-- table, an extra heap row and index entry to insert and later delete.
+ALTER TABLE octopus.event SET (toast_tuple_target = 8160);
 -- Skip markers only (rare): settle() finds them without looking at every stored event.
 CREATE INDEX IF NOT EXISTS event_markers ON octopus.event (sid) WHERE skip_to IS NOT NULL;
 
