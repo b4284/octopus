@@ -1474,6 +1474,32 @@ impl<B: Backend> Dispatcher<B> {
                 let ttl = self.cfg.worker_ttl;
                 let gone: Vec<String> =
                     core.workers.iter().filter(|(_, w)| now.duration_since(w.last_seen) > ttl).map(|(id, _)| id.clone()).collect();
+                if !gone.is_empty() {
+                    // A forgotten worker finishes nothing more: offer its events again now rather than at their
+                    // delivery timeout (flagged possibly_redelivered: it may have committed before going silent).
+                    let gone_set: HashSet<&String> = gone.iter().collect();
+                    let mut reoffered = 0u64;
+                    for st in core.groups.values_mut() {
+                        let GroupState { inflight, suspect, dirty, .. } = st;
+                        let before = inflight.len();
+                        inflight.retain(|s, f| {
+                            let keep = !gone_set.contains(&f.worker);
+                            if !keep {
+                                suspect.insert((s.clone(), f.pos));
+                            }
+                            keep
+                        });
+                        if inflight.len() != before {
+                            reoffered += (before - inflight.len()) as u64;
+                            *dirty = true;
+                        }
+                    }
+                    if reoffered > 0 {
+                        self.stats.timeouts.fetch_add(reoffered, Relaxed);
+                        woke = true;
+                        info!(workers = gone.len(), events = reoffered, "silent workers forgotten: their events are offered again");
+                    }
+                }
                 for id in gone {
                     core.workers.remove(&id);
                     core.reindex_worker(&id);

@@ -43,6 +43,7 @@ public sealed class OctopusWorker : IAsyncDisposable
     private readonly CancellationTokenSource _cts = new();
     private readonly Task _refresh;
     private int _rr;
+    private volatile bool _crashed;
     // deliveries whose result is sent but whose slot is not released yet: their credit is already back with the
     // dispatcher, so they no longer count against the slots
     private int _reportedHeld;
@@ -124,6 +125,7 @@ public sealed class OctopusWorker : IAsyncDisposable
 
     private void SendResult(OctopusDelivery d, WorkResult r)
     {
+        if (_crashed) return;
         var batch = new ResultBatch { WorkerId = _id, ReplyTo = _conn.Inbox };
         batch.Items.Add(r);
         // the delivering dispatcher if it is alive, otherwise any dispatcher
@@ -247,6 +249,7 @@ public sealed class OctopusWorker : IAsyncDisposable
 
     private void SendCredit(string member, int credit, bool reset)
     {
+        if (_crashed) return;
         if (!_conn.Members.TryGetValue(member, out var inbox)) return;
         var c = new WorkerCredit { WorkerId = _id, Inbox = _conn.Inbox, Credit = (uint)credit, Reset = reset, Slots = (uint)_slots };
         c.Groups.AddRange(_groups);
@@ -288,8 +291,22 @@ public sealed class OctopusWorker : IAsyncDisposable
             return $"{_id}: slots {_slots}, running {_running.Count}, queued {_deliveries.Reader.Count}, granted [{string.Join(", ", _granted.Select(kv => $"{kv.Key}={kv.Value}"))}], received {Received}, results {ResultsSent}";
     }
 
+    /// <summary>
+    /// Testing: behave as if this worker's process died now. It sends nothing more (no results, credits or progress)
+    /// and receives nothing more; its deliveries are left to the dispatchers' timeouts.
+    /// </summary>
+    public void Crash()
+    {
+        _crashed = true;
+        _cts.Cancel();
+        _conn.TopologyChanged -= OnTopologyChanged;
+        _conn.Workers.TryRemove(_id, out _);
+        _deliveries.Writer.TryComplete();
+    }
+
     public async ValueTask DisposeAsync()
     {
+        if (_crashed) return;
         _conn.TopologyChanged -= OnTopologyChanged;
         _conn.Workers.TryRemove(_id, out _);
         _cts.Cancel();
