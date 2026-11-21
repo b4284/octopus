@@ -155,10 +155,15 @@ BEGIN
           JOIN octopus.event e WITH (FORCESEEK) ON e.sid = s.id
          WHERE e.skip_to IS NOT NULL AND (e.epoch < s.epoch OR (e.epoch = s.epoch AND e.seq <= s.last_seq))
         OPTION (LOOP JOIN, FORCE ORDER);
+    -- Two range deletes, each a bounded seek: a seek on the source id alone would walk the source's newer rows too,
+    -- and wait for publishes that are inserting them (matrix-27: LCK_M_U on event keys, ~400 ms per settle).
     DELETE e
       FROM @ids i JOIN octopus.source s WITH (FORCESEEK) ON s.id = i.id
-      JOIN octopus.event e WITH (ROWLOCK, FORCESEEK) ON e.sid = s.id
-     WHERE e.epoch < s.epoch OR (e.epoch = s.epoch AND e.seq <= s.last_seq)
+      JOIN octopus.event e WITH (ROWLOCK, FORCESEEK) ON e.sid = s.id AND e.epoch = s.epoch AND e.seq <= s.last_seq
+    OPTION (LOOP JOIN, FORCE ORDER);
+    DELETE e
+      FROM @ids i JOIN octopus.source s WITH (FORCESEEK) ON s.id = i.id
+      JOIN octopus.event e WITH (ROWLOCK, FORCESEEK) ON e.sid = s.id AND e.epoch < s.epoch
     OPTION (LOOP JOIN, FORCE ORDER);
 END;
 GO
@@ -445,13 +450,23 @@ END;
 GO
 
 -- Rows left at or below their cursor by a publish/removal race on a source that has not moved since.
+-- Housekeeping that must never hold up the hot path: the candidates are found by a versioned read (no locks under
+-- READ_COMMITTED_SNAPSHOT), then deleted by key, skipping rows someone else holds (READPAST). A scanning DELETE held
+-- update locks across the table and blocked the cursor writes both ways (matrix-27).
 CREATE OR ALTER PROCEDURE octopus.purge_applied @limit int
 AS
 BEGIN
     SET NOCOUNT ON;
-    DELETE TOP (@limit) e
+    DECLARE @c TABLE (sid bigint, epoch bigint, seq bigint, PRIMARY KEY (sid, epoch, seq));
+    INSERT INTO @c
+    SELECT TOP (@limit) e.sid, e.epoch, e.seq
       FROM octopus.event e JOIN octopus.source s ON s.id = e.sid
      WHERE e.epoch < s.epoch OR (e.epoch = s.epoch AND e.seq <= s.last_seq);
+    DELETE e
+      FROM @c c JOIN octopus.event e WITH (ROWLOCK, READPAST, FORCESEEK) ON e.sid = c.sid AND e.epoch = c.epoch AND e.seq = c.seq
+      JOIN octopus.source s ON s.id = e.sid
+     WHERE e.epoch < s.epoch OR (e.epoch = s.epoch AND e.seq <= s.last_seq)
+    OPTION (LOOP JOIN, FORCE ORDER);
     SELECT CAST(@@ROWCOUNT AS bigint);
 END;
 GO
