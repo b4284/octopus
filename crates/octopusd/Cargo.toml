@@ -18,6 +18,7 @@ path = "src/main.rs"
 octopus-core.workspace = true
 octopus-pg = { path = "../octopus-pg" }
 octopus-mssql = { path = "../octopus-mssql" }
+octopus-mysql = { path = "../octopus-mysql" }
 octopus-proto = { path = "../octopus-proto" }
 octopus-fabric = { path = "../octopus-fabric" }
 bytes.workspace = true

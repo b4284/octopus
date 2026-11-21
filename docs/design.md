@@ -419,6 +419,12 @@ Postgres comes first. SQL Server (availability group with synchronous commit) an
   - every multi-row write is a distributed transaction.
 
   A colocated database helped 1.7×. Not a fit for this insert-then-delete workload.
+- **MySQL 8.4** (`crates/octopus-mysql`, 2026-11-22): stored procedures mirroring the PostgreSQL functions; batches as one
+  JSON parameter (`JSON_TABLE`, bodies `FROM_BASE64`); `utf8mb4_bin` names; READ COMMITTED sessions (no gap locks);
+  `GET_LOCK` for the migration (DDL is not transactional: every statement is idempotent); deadlock victims (1213) and
+  lock wait timeouts (1205) retried. MySQL allows a TEMPORARY table only once per statement, so the procedures copy
+  between per-session scratch tables instead of self-joining, and it has no partial indexes (skip markers through an
+  index on `(sid, skip_to)`). Same 16-test suite as PostgreSQL, passing.
 - The production topology the PostgreSQL backend was drilled in: [topology.md](topology.md).
 
 ## 9. Verification before anyone relies on it

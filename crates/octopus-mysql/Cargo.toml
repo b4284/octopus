@@ -1,0 +1,21 @@
+[package]
+name = "octopus-mysql"
+version = "0.1.0"
+description = "Octopus backend for MySQL 8.4 (InnoDB)"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+octopus-core.workspace = true
+bytes.workspace = true
+tokio.workspace = true
+mysql_async = { version = "0.37.1", default-features = false, features = ["minimal-rust"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+base64 = "0.22"
+xxhash-rust = { version = "0.8.21", features = ["xxh3"] }
+
+[dev-dependencies]
+tokio.workspace = true

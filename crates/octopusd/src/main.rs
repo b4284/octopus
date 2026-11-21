@@ -4,11 +4,12 @@
 //! |---|---|
 //! | `OCTOPUS_MEMBER_ID` | the host name |
 //! | `OCTOPUS_NS` | `octopus` |
-//! | `OCTOPUS_BACKEND` | `pg` (PostgreSQL) or `mssql` (SQL Server 2025) |
+//! | `OCTOPUS_BACKEND` | `pg` (PostgreSQL), `mssql` (SQL Server 2025) or `mysql` (MySQL 8.4) |
 //! | `OCTOPUS_PG` | `host=127.0.0.1 port=5432 user=octopus dbname=octopus` |
 //! | `OCTOPUS_MSSQL` (ADO.NET style) | `server=tcp:127.0.0.1,1433;database=octopus;user=octopus;TrustServerCertificate=true` |
-//! | `OCTOPUS_PG_POOL` (either backend) | `32` |
-//! | `OCTOPUS_SCHEMA` | `octopus` |
+//! | `OCTOPUS_MYSQL` (URL) | `mysql://octopus@127.0.0.1:3306/octopus` |
+//! | `OCTOPUS_PG_POOL` (any backend) | `32` |
+//! | `OCTOPUS_SCHEMA` | `octopus` (MySQL: the table prefix `<schema>_`) |
 //! | `OCTOPUS_APPLY_HOOK`, `OCTOPUS_LOAD_HOOK` | none |
 //! | `OCTOPUS_MQTT_HOST`, `OCTOPUS_MQTT_PORT` | `127.0.0.1`, `1883` |
 //! | `OCTOPUS_MQTT_USER`, `OCTOPUS_MQTT_PASSWORD` | none |
@@ -24,6 +25,7 @@ use std::time::Duration;
 use octopus_core::Backend;
 use octopus_fabric::{Fabric, MqttConfig};
 use octopus_mssql::{MssqlBackend, MssqlConfig};
+use octopus_mysql::{MysqlBackend, MysqlConfig};
 use octopus_pg::{PgBackend, PgConfig};
 use octopus_proto::Topics;
 use octopusd::{Config, Dispatcher};
@@ -75,13 +77,19 @@ async fn main() {
             (c.pool_size, c.schema, c.apply_hook, c.load_hook) = (pool, schema, apply_hook, load_hook);
             serve(cfg, retry(|| MssqlBackend::connect(c.clone())).await).await
         }
+        "mysql" => {
+            let mut c = MysqlConfig::new(env("OCTOPUS_MYSQL", "mysql://octopus@127.0.0.1:3306/octopus"));
+            (c.pool_size, c.apply_hook, c.load_hook) = (pool, apply_hook, load_hook);
+            c.prefix = format!("{schema}_");
+            serve(cfg, retry(|| MysqlBackend::connect(c.clone())).await).await
+        }
         "pg" => {
             let mut c = PgConfig::new(env("OCTOPUS_PG", "host=127.0.0.1 port=5432 user=octopus dbname=octopus"));
             (c.pool_size, c.schema, c.apply_hook, c.load_hook) = (pool, schema, apply_hook, load_hook);
             serve(cfg, retry(|| PgBackend::connect(c.clone())).await).await
         }
         other => {
-            error!(backend = other, "OCTOPUS_BACKEND: use pg or mssql");
+            error!(backend = other, "OCTOPUS_BACKEND: use pg, mssql or mysql");
             std::process::exit(2);
         }
     }

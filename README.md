@@ -63,10 +63,11 @@ Behind a small backend interface:
 - **PostgreSQL** (`octopus-pg`): the reference backend, drilled with Patroni across two data centers
   ([docs/topology.md](docs/topology.md)).
 - **SQL Server 2025** (`octopus-mssql`): the same model in T-SQL stored procedures; batches travel as JSON. Passes the
-  same backend test suite as PostgreSQL. Not yet selectable in `octopusd`.
+  same backend test suite as PostgreSQL. `OCTOPUS_BACKEND=mssql`.
 - **YugabyteDB** runs the PostgreSQL backend unchanged (all tests pass), but needed 25–45× PostgreSQL's CPU per event
   on this insert-then-delete workload: not recommended.
-- MySQL next.
+- **MySQL 8.4** (`octopus-mysql`): the same model in stored procedures; batches as JSON (`JSON_TABLE`, `FROM_BASE64`),
+  `utf8mb4_bin` names, READ COMMITTED sessions. Passes the same backend test suite. `OCTOPUS_BACKEND=mysql`.
 
 ## Try it
 
