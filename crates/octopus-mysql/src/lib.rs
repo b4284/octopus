@@ -145,7 +145,11 @@ impl MysqlBackend {
         let opts = Opts::from_url(&cfg.connection).map_err(|e| Error::Config(format!("connection: {e}")))?;
         let constraints = PoolConstraints::new(1, cfg.pool_size.max(1)).expect("pool constraints");
         let opts = OptsBuilder::from_opts(opts)
-            .pool_opts(PoolOpts::default().with_constraints(constraints))
+            // no COM_RESET_CONNECTION when a connection goes back to the pool: it would drop the procedures'
+            // per-session scratch tables and re-run the session setup on every operation (matrix-31: ~70
+            // connection setups per second). Every procedure empties its scratch tables before use, and a failed one
+            // is rolled back by the caller.
+            .pool_opts(PoolOpts::default().with_constraints(constraints).with_reset_connection(false))
             .tcp_nodelay(true)
             .init(vec![
                 "SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED",
