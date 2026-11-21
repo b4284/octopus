@@ -110,9 +110,13 @@ Any layer-4 load balancer works if:
 2. **Established sessions are cut when a target turns unhealthy.** This one matters most. HAProxy does it with
    `on-marked-down shutdown-sessions`. Many network load balancers keep the flow to an unhealthy target until an
    idle timeout (minutes) unless configured otherwise (AWS NLB: terminate connections on unhealthy targets).
-   Without it, clients depend on their own TCP keepalives and operation timeouts.
-3. **Fast detection.** Every second of check interval × failure threshold adds to the outage. HAProxy in the
-   drills: 1 s × 2. Cloud load balancers often check every 5 s at best.
+   Without it, clients depend on their own TCP keepalives and operation timeouts. Measured (benchmark matrix-35,
+   the leader's DC frozen for 60 s, 5 s checks): **83–84 s outage without cutting** (1,500–1,750 worker calls hung
+   on the frozen leader until their 60 s timeout) **against 27–30 s with it**. A killed host's sessions get reset
+   at once and don't show the difference; a frozen or partitioned one does.
+3. **Fast detection.** Every second of check interval × failure threshold, and of interval × rise threshold before
+   the new leader takes traffic, adds to the outage. Leader-DC kill drills: 18–22 s with 1 s checks, 24–30 s with
+   5 s checks (matrix-19, matrix-35). Cloud load balancers often check every 5 s at best.
 4. **Targets in both DCs**, or one load balancer per DC whose targets include the other DC's nodes, or DNS/global
    load balancing in front.
 5. **Redundancy.** A managed load balancer is redundant by itself. HAProxy needs it arranged: one per application
