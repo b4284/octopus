@@ -10,7 +10,7 @@ across two data centers with Patroni, etcd and a leader-following load balancer.
                                   │ MQTT (request/reply)
                                   ▼
              ┌──────────────────────────────────────────┐
-             │ MQTT broker                              │
+             │ MQTT broker, or a NATS cluster           │
              └──────┬──────────────┬──────────────┬─────┘
                     │              │              │
              ┌──────▼─────┐ ┌──────▼─────┐ ┌──────▼─────┐  OCTOPUS DISPATCHERS, active-active:
@@ -83,6 +83,7 @@ across two data centers with Patroni, etcd and a leader-following load balancer.
 | the database is frozen for minutes | everyone retries; nobody cancels a commit | a 10-minute freeze passes |
 | a dispatcher loses its database while alive | its leases expire under it; it stops handing out | passes |
 | the MQTT broker restarts | retained announcements are re-sent every 5 s | passes |
+| a NATS cluster node dies (3-node cluster, `OCTOPUS_TRANSPORT=nats`) | clients and dispatchers reconnect to another node in milliseconds; messages in flight come again through retries | no outage; e2e max = the 30 s delivery timeout; nothing lost (benchmark matrix-36) |
 | a source loses an event | "missing below" in acks, high-water announcements, skip markers, gap timeout | built and tested |
 
 ## Requirements this topology depends on
