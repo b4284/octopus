@@ -647,22 +647,25 @@ impl Backend for MysqlBackend {
             return Ok(vec![]);
         }
         let g = serde_json::to_string(groups).unwrap();
-        // sources with something stored beyond the cursor but no head; the first stored position tells the gap
+        // sources whose first stored position beyond the cursor is not the head. That first position comes from two
+        // bounded index seeks (the rest of the cursor's epoch, then later epochs); the time waited is that event's.
+        // (An aggregate over all of a source's later events with OR'ed range conditions ran for minutes: matrix-31.)
         let sql = self.q(
-            "SELECT s.grp, s.source, s.epoch, s.last_seq, \
-                    (SELECT f.epoch FROM octopus_event f WHERE f.sid = s.id AND (f.epoch > s.epoch OR (f.epoch = s.epoch AND f.seq > s.last_seq)) \
-                      ORDER BY f.epoch, f.seq LIMIT 1) AS fe, \
-                    (SELECT f.seq FROM octopus_event f WHERE f.sid = s.id AND (f.epoch > s.epoch OR (f.epoch = s.epoch AND f.seq > s.last_seq)) \
-                      ORDER BY f.epoch, f.seq LIMIT 1) AS fq, \
-                    CAST(TIMESTAMPDIFF(MICROSECOND, w.first_enq, UTC_TIMESTAMP(6)) AS SIGNED) AS waited, gr.gap_skip_ms \
+            "SELECT s.grp, s.source, s.epoch, s.last_seq, f.epoch, f.seq, \
+                    CAST(TIMESTAMPDIFF(MICROSECOND, f.enqueued_at, UTC_TIMESTAMP(6)) AS SIGNED) AS waited, gr.gap_skip_ms \
                FROM JSON_TABLE(?, '$[*]' COLUMNS (v VARCHAR(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin PATH '$')) x \
                JOIN octopus_source s ON s.grp = x.v \
                JOIN octopus_grp gr ON gr.name = s.grp \
-               JOIN LATERAL (SELECT MIN(e.enqueued_at) AS first_enq, COUNT(*) AS n FROM octopus_event e \
-                              WHERE e.sid = s.id AND (e.epoch > s.epoch OR (e.epoch = s.epoch AND e.seq > s.last_seq))) w \
-              WHERE w.n > 0 \
-                AND NOT EXISTS (SELECT 1 FROM octopus_event h WHERE h.sid = s.id AND h.epoch = s.epoch AND h.seq = s.last_seq + 1) \
-                AND (? = 0 OR w.first_enq <= TIMESTAMPADD(MICROSECOND, -? * 1000, UTC_TIMESTAMP(6))) \
+               JOIN LATERAL ( \
+                    SELECT u.epoch, u.seq, u.enqueued_at FROM ( \
+                        (SELECT e.epoch, e.seq, e.enqueued_at FROM octopus_event e \
+                          WHERE e.sid = s.id AND e.epoch = s.epoch AND e.seq > s.last_seq ORDER BY e.seq LIMIT 1) \
+                        UNION ALL \
+                        (SELECT e.epoch, e.seq, e.enqueued_at FROM octopus_event e \
+                          WHERE e.sid = s.id AND e.epoch > s.epoch ORDER BY e.epoch, e.seq LIMIT 1)) u \
+                     ORDER BY u.epoch, u.seq LIMIT 1) f \
+              WHERE NOT (f.epoch = s.epoch AND f.seq = s.last_seq + 1) \
+                AND (? = 0 OR f.enqueued_at <= TIMESTAMPADD(MICROSECOND, -? * 1000, UTC_TIMESTAMP(6))) \
               ORDER BY waited DESC LIMIT ?",
         );
         let older = ms(older_than);
