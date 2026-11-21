@@ -46,7 +46,17 @@ COMMIT;
 async fn backend() -> PgBackend {
     let (client, conn) = tokio_postgres::connect(&conn_str(), tokio_postgres::NoTls).await.expect("connect");
     tokio::spawn(conn);
-    client.batch_execute(HOOKS).await.expect("hooks");
+    // (retried: concurrent DDL from parallel tests can fail serialization on distributed SQL such as YugabyteDB)
+    for attempt in 1.. {
+        match client.batch_execute(HOOKS).await {
+            Ok(()) => break,
+            Err(e) if attempt < 20 && e.code() == Some(&tokio_postgres::error::SqlState::T_R_SERIALIZATION_FAILURE) => {
+                let _ = client.batch_execute("ROLLBACK").await;
+                tokio::time::sleep(std::time::Duration::from_millis(50 * attempt)).await;
+            }
+            Err(e) => panic!("hooks: {e}"),
+        }
+    }
     let mut cfg = PgConfig::new(conn_str());
     cfg.apply_hook = Some("octo_test.apply".into());
     cfg.load_hook = Some("octo_test.load".into());

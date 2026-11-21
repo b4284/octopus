@@ -23,6 +23,7 @@ fn head_row(r: &tokio_postgres::Row, at: usize) -> Head {
         skip_to: r.get(at + 7),
     }
 }
+use tokio_postgres::error::SqlState;
 use tokio_postgres::NoTls;
 
 const SCHEMA_SQL: &str = include_str!("../sql/001_init.sql");
@@ -122,7 +123,7 @@ impl PgBackend {
             if current.as_deref() != Some(version.as_str()) {
                 // Under the lock, look again: several members starting together must not each run the script
                 // (the later ones would take its locks while the first is already serving).
-                let migrate = async {
+                let migrate = || async {
                     client.batch_execute("BEGIN; SELECT pg_advisory_xact_lock(hashtext('octopus-migrate'))").await?;
                     let has_meta: bool = client.query_one("SELECT to_regclass($1) IS NOT NULL", &[&meta]).await?.get(0);
                     let current: Option<String> = if has_meta {
@@ -142,9 +143,22 @@ impl PgBackend {
                     }
                     client.batch_execute("COMMIT").await
                 };
-                if let Err(e) = migrate.await {
-                    let _ = client.batch_execute("ROLLBACK").await;
-                    return Err(db(e));
+                // A serialization failure or deadlock (distributed SQL such as YugabyteDB: a migrator that waited for
+                // the lock can still hold an older snapshot) is retried; the retry sees the committed version.
+                let mut attempt = 0;
+                loop {
+                    match migrate().await {
+                        Ok(()) => break,
+                        Err(e) => {
+                            let _ = client.batch_execute("ROLLBACK").await;
+                            let retry = e.code().is_some_and(|c| *c == SqlState::T_R_SERIALIZATION_FAILURE || *c == SqlState::T_R_DEADLOCK_DETECTED);
+                            attempt += 1;
+                            if !retry || attempt >= 20 {
+                                return Err(db(e));
+                            }
+                            tokio::time::sleep(Duration::from_millis(50 * attempt)).await;
+                        }
+                    }
                 }
             }
         }

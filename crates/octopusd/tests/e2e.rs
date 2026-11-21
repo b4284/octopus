@@ -194,7 +194,18 @@ async fn wait_all_applied(sources: &[String], seqs: i64, limit: Duration) {
 }
 
 async fn setup(ns: &str, groups: usize, sources: usize) -> (Vec<String>, Vec<String>) {
-    db().await.batch_execute(HOOKS).await.unwrap();
+    // (retried: concurrent DDL from parallel tests can fail serialization on distributed SQL such as YugabyteDB)
+    let c = db().await;
+    for attempt in 1.. {
+        match c.batch_execute(HOOKS).await {
+            Ok(()) => break,
+            Err(e) if attempt < 20 && e.code() == Some(&tokio_postgres::error::SqlState::T_R_SERIALIZATION_FAILURE) => {
+                let _ = c.batch_execute("ROLLBACK").await;
+                tokio::time::sleep(Duration::from_millis(50 * attempt)).await;
+            }
+            Err(e) => panic!("hooks: {e}"),
+        }
+    }
     let groups: Vec<String> = (0..groups).map(|i| format!("g{i}")).collect();
     let sources: Vec<String> = (0..sources).map(|i| format!("{ns}-s{i}")).collect();
     (groups, sources)
