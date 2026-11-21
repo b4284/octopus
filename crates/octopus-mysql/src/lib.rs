@@ -310,12 +310,13 @@ impl Backend for MysqlBackend {
         };
         let j = serde_json::to_string(&items).unwrap();
         // A source not found aborts the batch (nothing acknowledged): the cache believed it registered, or a
-        // concurrent registration of it had not become visible yet. Retry with registration, briefly backing off.
+        // concurrent registration of it had not become visible yet (its commit can take a while under load: 5
+        // attempts, ~110 ms, were not always enough at 16k ev/s). Retry with registration, backing off up to ~0.4 s.
         let mut known = all_known;
         let mut attempt = 0u64;
         let rows = loop {
             match self.rows(&self.q("CALL octopus_publish(?, ?)"), (j.clone(), known as i64)).await {
-                Err(Error::Database(m)) if m.contains("unknown source in publish batch") && attempt < 5 => {
+                Err(Error::Database(m)) if m.contains("unknown source in publish batch") && attempt < 8 => {
                     attempt += 1;
                     let n = self.unknown_retries.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
                     if known {

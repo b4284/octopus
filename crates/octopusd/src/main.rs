@@ -11,8 +11,11 @@
 //! | `OCTOPUS_PG_POOL` (any backend) | `32` |
 //! | `OCTOPUS_SCHEMA` | `octopus` (MySQL: the table prefix `<schema>_`) |
 //! | `OCTOPUS_APPLY_HOOK`, `OCTOPUS_LOAD_HOOK` | none |
+//! | `OCTOPUS_TRANSPORT` | `mqtt` or `nats` |
 //! | `OCTOPUS_MQTT_HOST`, `OCTOPUS_MQTT_PORT` | `127.0.0.1`, `1883` |
 //! | `OCTOPUS_MQTT_USER`, `OCTOPUS_MQTT_PASSWORD` | none |
+//! | `OCTOPUS_NATS_URL` (several servers: comma-separated) | `nats://127.0.0.1:4222` |
+//! | `OCTOPUS_NATS_USER`, `OCTOPUS_NATS_PASSWORD` | none |
 //! | `OCTOPUS_LEASE_TTL_MS`, `OCTOPUS_TICK_MS`, `OCTOPUS_DRAIN_MS` | `3000`, `500`, `5000` |
 //! | `OCTOPUS_GAP_ALERT_MS`, `OCTOPUS_GAP_CHECK_MS` (report a source stopped by a missing event) | `30000`, `10000` |
 //! | `OCTOPUS_GAP_SKIP_MS` (skip a gap after this long; per group: `octopus.grp.gap_skip_ms`, negative = never) | unset: never |
@@ -23,7 +26,7 @@
 use std::time::Duration;
 
 use octopus_core::Backend;
-use octopus_fabric::{Fabric, MqttConfig};
+use octopus_fabric::{Fabric, MqttConfig, NatsConfig};
 use octopus_mssql::{MssqlBackend, MssqlConfig};
 use octopus_mysql::{MysqlBackend, MysqlConfig};
 use octopus_pg::{PgBackend, PgConfig};
@@ -114,15 +117,33 @@ where
 
 async fn serve<B: Backend>(cfg: octopusd::Config, backend: B) {
     let topics = Topics::new(cfg.ns.clone());
-    let mut mq = MqttConfig::new(
-        env("OCTOPUS_MQTT_HOST", "127.0.0.1"),
-        env("OCTOPUS_MQTT_PORT", "1883").parse().unwrap_or(1883),
-        format!("octopusd-{}-{}", cfg.ns, cfg.member_id),
-    );
-    mq.username = std::env::var("OCTOPUS_MQTT_USER").ok();
-    mq.password = std::env::var("OCTOPUS_MQTT_PASSWORD").ok();
-    mq.last_will = Some(Dispatcher::<B>::last_will(&topics, &cfg.member_id));
-    let (fabric, incoming) = Fabric::connect_mqtt(mq);
+    let client = format!("octopusd-{}-{}", cfg.ns, cfg.member_id);
+    let (fabric, incoming) = if env("OCTOPUS_TRANSPORT", "mqtt") == "nats" {
+        // NATS keeps no retained messages and has no last will: the periodic announcements carry membership and
+        // ownership, and a dead member's groups are announced again by their next owner.
+        let mut n = NatsConfig::new(env("OCTOPUS_NATS_URL", "nats://127.0.0.1:4222"), client);
+        n.username = std::env::var("OCTOPUS_NATS_USER").ok();
+        n.password = std::env::var("OCTOPUS_NATS_PASSWORD").ok();
+        loop {
+            match Fabric::connect_nats(n.clone()).await {
+                Ok(f) => break f,
+                Err(e) => {
+                    error!(error = %e, "NATS not reachable; retrying");
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
+            }
+        }
+    } else {
+        let mut mq = MqttConfig::new(
+            env("OCTOPUS_MQTT_HOST", "127.0.0.1"),
+            env("OCTOPUS_MQTT_PORT", "1883").parse().unwrap_or(1883),
+            client,
+        );
+        mq.username = std::env::var("OCTOPUS_MQTT_USER").ok();
+        mq.password = std::env::var("OCTOPUS_MQTT_PASSWORD").ok();
+        mq.last_will = Some(Dispatcher::<B>::last_will(&topics, &cfg.member_id));
+        Fabric::connect_mqtt(mq)
+    };
 
     let (stop_tx, stop_rx) = watch::channel(false);
     tokio::spawn(async move {
