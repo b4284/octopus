@@ -170,10 +170,10 @@ impl Zmq {
                             let mut f = m.into_vec();
                             if f.len() == 3 {
                                 f.remove(0); // the sender's identity: replies are addressed by topic
-                                if let Some(i) = incoming(msg(f)) {
-                                    if itx.send(i).await.is_err() {
-                                        return;
-                                    }
+                                if let Some(i) = incoming(msg(f))
+                                    && itx.send(i).await.is_err()
+                                {
+                                    return;
                                 }
                             }
                         }
@@ -319,10 +319,10 @@ fn spawn_dealer(
             loop {
                 match recv.recv().await {
                     Ok(m) => {
-                        if let Some(i) = incoming(m) {
-                            if in_tx.send(i).await.is_err() {
-                                return;
-                            }
+                        if let Some(i) = incoming(m)
+                            && in_tx.send(i).await.is_err()
+                        {
+                            return;
                         }
                     }
                     Err(e) => {
