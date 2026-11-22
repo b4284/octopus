@@ -28,8 +28,11 @@ public sealed class OctopusOptions
     /// destination to 1/Linger at an added latency of at most Linger.
     /// </summary>
     public TimeSpan Linger { get; set; } = TimeSpan.FromMilliseconds(2);
-    /// <summary>"mqtt" (default) or "nats". With NATS, Host/Port name the NATS server (default port 4222).</summary>
+    /// <summary>"mqtt" (default), "nats" or "zmq". With NATS, Host/Port name the NATS server (default port 4222). With
+    /// ZeroMQ there is no broker: <see cref="ZmqPeers"/> lists the dispatchers.</summary>
     public string Transport { get; set; } = "mqtt";
+    /// <summary>ZeroMQ: every dispatcher as <c>id@host:port</c>, comma-separated (ROUTER on port, PUB on port + 1).</summary>
+    public string? ZmqPeers { get; set; }
 }
 
 /// <summary>
@@ -87,6 +90,7 @@ public sealed class OctopusConnection : IAsyncDisposable
     private readonly IMqttClient? _client;
     private readonly MqttClientOptions? _options;
     private readonly NatsConnection? _nats;
+    private readonly ZmqTransport? _zmq;
     private readonly ConcurrentDictionary<string, byte> _filters = new();
     private readonly ConcurrentDictionary<string, Outbox> _outboxes = new();
     private readonly CancellationTokenSource _cts = new();
@@ -115,6 +119,16 @@ public sealed class OctopusConnection : IAsyncDisposable
         Topics = new Topics(o.Namespace);
         Inbox = Topics.Inbox(o.ClientId);
         _qos = o.QoS == 0 ? MqttQualityOfServiceLevel.AtMostOnce : MqttQualityOfServiceLevel.AtLeastOnce;
+        if (o.Transport.Equals("zmq", StringComparison.OrdinalIgnoreCase))
+        {
+            var peers = ZmqTransport.ParsePeers(o.ZmqPeers ?? throw new ArgumentException("ZmqPeers is required with the zmq transport"));
+            _zmq = new ZmqTransport(o.ClientId, o.Namespace, peers, (topic, payload) =>
+            {
+                Interlocked.Increment(ref Received);
+                OnMessage(topic, payload);
+            });
+            return;
+        }
         if (o.Transport.Equals("nats", StringComparison.OrdinalIgnoreCase))
         {
             int port = o.Port == 1883 ? 4222 : o.Port;
@@ -163,7 +177,8 @@ public sealed class OctopusConnection : IAsyncDisposable
     {
         var c = new OctopusConnection(o);
         if (c._nats != null) await c._nats.ConnectAsync();
-        else await c._client!.ConnectAsync(c._options!, ct);
+        else if (c._client != null) await c._client.ConnectAsync(c._options!, ct);
+        // (ZeroMQ connects in the background and reconnects on its own)
         await c.SubscribeAsync(c.Inbox, ct);
         await c.SubscribeAsync(c.Topics.MembersFilter, ct);
         await c.SubscribeAsync(c.Topics.OwnersFilter, ct);
@@ -197,6 +212,11 @@ public sealed class OctopusConnection : IAsyncDisposable
 
     public async Task SubscribeAsync(string filter, CancellationToken ct = default)
     {
+        if (_zmq != null)
+        {
+            if (_filters.TryAdd(filter, 0)) _zmq.Subscribe(filter);
+            return;
+        }
         if (!_filters.TryAdd(filter, 0) && _nats != null) return; // NATS keeps subscriptions across reconnects
         if (_nats != null)
         {
@@ -235,6 +255,11 @@ public sealed class OctopusConnection : IAsyncDisposable
     private async Task PublishRawAsync(string topic, byte[] payload)
     {
         Interlocked.Increment(ref Sent);
+        if (_zmq != null)
+        {
+            _zmq.Publish(topic, payload);
+            return;
+        }
         if (_nats != null)
         {
             await _nats.PublishAsync(NatsSubjects.Of(topic).Subject, payload, cancellationToken: _cts.Token);
@@ -367,6 +392,11 @@ public sealed class OctopusConnection : IAsyncDisposable
     public async ValueTask DisposeAsync()
     {
         _cts.Cancel();
+        if (_zmq != null)
+        {
+            _zmq.Dispose();
+            return;
+        }
         if (_nats != null)
         {
             try { await _nats.DisposeAsync(); } catch { /* closing */ }

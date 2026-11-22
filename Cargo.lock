@@ -622,6 +622,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "42703706b716c37f96a77aea830392ad231f44c9e9a67872fa5548707e11b11c"
 
 [[package]]
+name = "futures"
+version = "0.3.34"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9a31d2a3fbaaeb2af2368bbdd904aa8e812d3c04a1ee10d3171f52d556e5d0a3"
+dependencies = [
+ "futures-channel",
+ "futures-core",
+ "futures-io",
+ "futures-sink",
+ "futures-task",
+ "futures-util",
+]
+
+[[package]]
 name = "futures-channel"
 version = "0.3.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -678,6 +692,7 @@ version = "0.3.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0d50a92467f8ba5dd6e3ee5d4bd04d73ab2e4e1c44474a0674821dfce14b79bc"
 dependencies = [
+ "futures-channel",
  "futures-core",
  "futures-io",
  "futures-macro",
@@ -1237,6 +1252,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "tracing",
+ "zeromq",
 ]
 
 [[package]]
@@ -1809,10 +1825,26 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
 
 [[package]]
+name = "saa"
+version = "5.6.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4e80a530676d97ef2167d7fb184a860166cd265bf98be494064828d7aaa43446"
+
+[[package]]
 name = "saturating"
 version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ece8e78b2f38ec51c51f5d475df0a7187ba5111b2a28bdc761ee05b075d40a71"
+
+[[package]]
+name = "scc"
+version = "3.9.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "002119cb88171e2ae67ca2e02f989d1021dd0b18209436924256ee595ade6006"
+dependencies = [
+ "saa",
+ "sdd",
+]
 
 [[package]]
 name = "schannel"
@@ -1828,6 +1860,12 @@ name = "scopeguard"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
+
+[[package]]
+name = "sdd"
+version = "4.10.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "10aff4a76629f4e3dddd3afc9a649b1a757e0bffdf0b45093e7dd676a15c1d5f"
 
 [[package]]
 name = "secrecy"
@@ -2523,6 +2561,7 @@ version = "1.26.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2ef6dac1e96601b4fb3acccccff2139741fcb757cb9a36089bf5be91cfb285ce"
 dependencies = [
+ "getrandom 0.4.3",
  "js-sys",
  "wasm-bindgen",
 ]
@@ -2814,6 +2853,30 @@ name = "zeroize"
 version = "1.9.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "85ccff8a4805aba1eaa4cd4afcd49f7557dd2cf5fd79ffc37f8959466effc5aa"
+
+[[package]]
+name = "zeromq"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "55b31ad37d1aad854ddc8c4f16b637259ce95f757f6c32f05447279c68ed9e2a"
+dependencies = [
+ "async-trait",
+ "asynchronous-codec",
+ "bytes",
+ "crossbeam-queue",
+ "futures",
+ "futures-channel",
+ "log",
+ "parking_lot",
+ "rand 0.10.4",
+ "regex",
+ "scc",
+ "socket2",
+ "thiserror",
+ "tokio",
+ "tokio-util",
+ "uuid",
+]
 
 [[package]]
 name = "zerotrie"

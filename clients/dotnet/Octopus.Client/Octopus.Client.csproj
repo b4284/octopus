@@ -5,7 +5,7 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <RootNamespace>Octopus.Client</RootNamespace>
-    <Description>Octopus client for .NET: producers and workers over MQTT 5.</Description>
+    <Description>Octopus client for .NET: producers and workers over MQTT 5, NATS or ZeroMQ.</Description>
     <PackageLicenseExpression>GPL-3.0-only</PackageLicenseExpression>
   </PropertyGroup>
 
@@ -21,6 +21,7 @@
     </PackageReference>
     <PackageReference Include="MQTTnet" Version="5.2.0.1603" />
     <PackageReference Include="NATS.Net" Version="3.3.2" />
+    <PackageReference Include="NetMQ" Version="4.0.4.5" />
   </ItemGroup>
 
 </Project>

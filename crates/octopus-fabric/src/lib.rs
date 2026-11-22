@@ -8,8 +8,13 @@
 //! members and owners every 5 s, so a newcomer waits at most that long), and a dispatcher that dies without saying so
 //! is noticed through lease expiry and worker timeouts.
 //!
+//! ZeroMQ (module `zmq`) needs no broker at all: clients talk to the dispatchers directly.
+//!
 //! The fabric is never the durability point: callers treat every message as possibly lost, repeated or
 //! reordered.
+
+mod zmq;
+pub use zmq::{ZmqConfig, ZmqPeer};
 
 use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
@@ -111,6 +116,7 @@ pub struct Fabric {
 enum Inner {
     Mqtt { client: AsyncClient, qos: QoS },
     Nats { client: async_nats::Client, tx: mpsc::Sender<Incoming> },
+    Zmq(Arc<zmq::Zmq>),
 }
 
 /// One topic segment as a NATS subject token: the characters NATS reserves are percent-encoded.
@@ -264,8 +270,24 @@ impl Fabric {
         Ok((Fabric { inner: Inner::Nats { client, tx }, subscriptions: Arc::new(Mutex::new(BTreeSet::new())) }, rx))
     }
 
+    /// Brokerless: binds this dispatcher's sockets (if `me` is among the peers) and connects to every other dispatcher
+    /// (reconnecting for ever in the background). See the `zmq` module docs for the routing.
+    pub async fn connect_zmq(cfg: ZmqConfig) -> Result<(Fabric, mpsc::Receiver<Incoming>)> {
+        let (z, rx) = zmq::Zmq::connect(cfg).await?;
+        Ok((Fabric { inner: Inner::Zmq(z), subscriptions: Arc::new(Mutex::new(BTreeSet::new())) }, rx))
+    }
+
+    /// ZeroMQ only: the dispatchers currently connected.
+    pub fn zmq_connected(&self) -> Vec<String> {
+        match &self.inner {
+            Inner::Zmq(z) => z.connected(),
+            _ => vec![],
+        }
+    }
+
     pub async fn publish(&self, topic: impl Into<String>, payload: Bytes) -> Result<()> {
         match &self.inner {
+            Inner::Zmq(z) => z.publish(topic.into(), payload).await,
             Inner::Mqtt { client, qos } => client.publish(topic, *qos, false, payload).await.map_err(|e| Error::Fabric(e.to_string())),
             Inner::Nats { client, .. } => {
                 let (subject, _) = nats_subject(&topic.into());
@@ -279,6 +301,7 @@ impl Fabric {
         match &self.inner {
             Inner::Mqtt { client, qos } => client.publish(topic, *qos, true, payload).await.map_err(|e| Error::Fabric(e.to_string())),
             Inner::Nats { .. } => self.publish(topic, payload).await,
+            Inner::Zmq(z) => z.publish_retained(topic.into(), payload).await,
         }
     }
 
@@ -291,6 +314,10 @@ impl Fabric {
             }
         }
         match &self.inner {
+            Inner::Zmq(z) => {
+                z.subscribe(&f);
+                Ok(())
+            }
             Inner::Mqtt { client, qos } => client.subscribe(f, *qos).await.map_err(|e| Error::Fabric(e.to_string())),
             Inner::Nats { client, tx } => {
                 let (subject, queue) = nats_subject(&f);
@@ -322,6 +349,7 @@ impl Fabric {
                 let _ = client.flush().await;
                 let _ = client.drain().await;
             }
+            Inner::Zmq(_) => {}
         }
     }
 }

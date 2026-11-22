@@ -12,11 +12,13 @@
 //! | `OCTOPUS_PG_POOL` (any backend) | `32` |
 //! | `OCTOPUS_SCHEMA` | `octopus` (MySQL: the table prefix `<schema>_`) |
 //! | `OCTOPUS_APPLY_HOOK`, `OCTOPUS_LOAD_HOOK` | none |
-//! | `OCTOPUS_TRANSPORT` | `mqtt` or `nats` |
+//! | `OCTOPUS_TRANSPORT` | `mqtt`, `nats` or `zmq` (ZeroMQ, no broker) |
 //! | `OCTOPUS_MQTT_HOST`, `OCTOPUS_MQTT_PORT` | `127.0.0.1`, `1883` |
 //! | `OCTOPUS_MQTT_USER`, `OCTOPUS_MQTT_PASSWORD` | none |
 //! | `OCTOPUS_NATS_URL` (several servers: comma-separated) | `nats://127.0.0.1:4222` |
 //! | `OCTOPUS_NATS_USER`, `OCTOPUS_NATS_PASSWORD` | none |
+//! | `OCTOPUS_ZMQ_PEERS` (every dispatcher as `id@host:port`: ROUTER on port, PUB on port + 1; must list this one) | none |
+//! | `OCTOPUS_ZMQ_BIND_HOST` | `0.0.0.0` |
 //! | `OCTOPUS_LEASE_TTL_MS`, `OCTOPUS_TICK_MS`, `OCTOPUS_DRAIN_MS` | `3000`, `500`, `5000` |
 //! | `OCTOPUS_GAP_ALERT_MS`, `OCTOPUS_GAP_CHECK_MS` (report a source stopped by a missing event) | `30000`, `10000` |
 //! | `OCTOPUS_GAP_SKIP_MS` (skip a gap after this long; per group: `octopus.grp.gap_skip_ms`, negative = never) | unset: never |
@@ -27,7 +29,7 @@
 use std::time::Duration;
 
 use octopus_core::Backend;
-use octopus_fabric::{Fabric, MqttConfig, NatsConfig};
+use octopus_fabric::{Fabric, MqttConfig, NatsConfig, ZmqConfig, ZmqPeer};
 use octopus_mssql::{MssqlBackend, MssqlConfig};
 use octopus_mysql::{MysqlBackend, MysqlConfig};
 use octopus_pg::{PgBackend, PgConfig};
@@ -120,7 +122,18 @@ where
 async fn serve<B: Backend>(cfg: octopusd::Config, backend: B) {
     let topics = Topics::new(cfg.ns.clone());
     let client = format!("octopusd-{}-{}", cfg.ns, cfg.member_id);
-    let (fabric, incoming) = if env("OCTOPUS_TRANSPORT", "mqtt") == "nats" {
+    let transport = env("OCTOPUS_TRANSPORT", "mqtt");
+    let (fabric, incoming) = if transport == "zmq" {
+        // brokerless: this dispatcher binds its entry in the list, clients connect to every entry
+        let peers = match ZmqPeer::parse_list(&env("OCTOPUS_ZMQ_PEERS", "")) {
+            Ok(p) if p.iter().any(|p| p.id == cfg.member_id) => p,
+            Ok(_) => panic!("OCTOPUS_ZMQ_PEERS must list this dispatcher ({}) as {}@host:port", cfg.member_id, cfg.member_id),
+            Err(e) => panic!("OCTOPUS_ZMQ_PEERS: {e}"),
+        };
+        let mut z = ZmqConfig::new(cfg.member_id.clone(), peers);
+        z.bind_host = env("OCTOPUS_ZMQ_BIND_HOST", "0.0.0.0");
+        Fabric::connect_zmq(z).await.unwrap_or_else(|e| panic!("{e}"))
+    } else if transport == "nats" {
         // NATS keeps no retained messages and has no last will: the periodic announcements carry membership and
         // ownership, and a dead member's groups are announced again by their next owner.
         let mut n = NatsConfig::new(env("OCTOPUS_NATS_URL", "nats://127.0.0.1:4222"), client);
